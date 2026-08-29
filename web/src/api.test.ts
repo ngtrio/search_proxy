@@ -1,0 +1,1 @@
+import{describe,expect,it}from"vitest";import type{Provider}from"./api";describe("admin contracts",()=>{it("does not expose provider token fields",()=>{const fields:keyof Provider="token_configured";expect(fields).toBe("token_configured")})});

@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+.env
+data
+target
+node_modules
+web/dist
+web/node_modules
+*.db
+*.db-shm
+*.db-wal
