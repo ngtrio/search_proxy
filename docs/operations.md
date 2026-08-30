@@ -8,35 +8,15 @@ Copy `.env.example` to `.env`, set a long administrator password, then run `dock
 
 Liveness (`/health/live`) only confirms that the process responds.
 
-An unavailable provider is logged and skipped during startup so the administration plane remains available for recovery.
+An enabled provider that cannot connect during startup causes the gateway to fail to start. Restart it after the provider is available again.
 
-## Reverse proxy
+## TLS and request handling
 
-Nginx:
+The Compose deployment publishes the gateway only on `127.0.0.1:3000`; this repository does not install or configure a reverse proxy. Terminate TLS in the deployment environment and keep that configuration with the infrastructure that owns it.
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    proxy_read_timeout 180s;
-    proxy_send_timeout 180s;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto https;
-}
-```
+MCP Streamable HTTP responses may use SSE, and long-running tools may keep one request open for several minutes. Every hop in front of the gateway must therefore pass streaming responses without buffering and use request, response-header, and idle timeouts suitable for the longest enabled provider call. The gateway does not impose a per-provider tool-call timeout.
 
-Caddy:
-
-```caddy
-search.example.com {
-    reverse_proxy 127.0.0.1:3000 {
-        flush_interval -1
-        transport http { response_header_timeout 180s }
-    }
-}
-```
+The Compose healthcheck's three-second timeout applies only to `/health/live`; it is not a limit on MCP tool calls.
 
 ## Backup and restore
 

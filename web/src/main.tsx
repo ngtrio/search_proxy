@@ -1,11 +1,11 @@
 import React, { FormEvent, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ClientKey, OverviewData, Provider, RequestEvent, setCsrf } from "./api";
+import { api, canonicalTools, ClientKey, OverviewData, Provider, ProviderKind, RequestEvent, setCsrf } from "./api";
 import "./styles.css";
 
 type Page = "overview" | "providers" | "keys" | "requests";
 type ProviderForm = Pick<Provider, "kind" | "name" | "endpoint" | "weight" | "enabled"> & { token: string };
-const emptyProvider: ProviderForm = { kind: "searchix", name: "", endpoint: "https://", token: "", weight: 1, enabled: true };
+const emptyProvider: ProviderForm = { kind: ProviderKind.Searchix, name: "", endpoint: "https://", token: "", weight: 1, enabled: true };
 
 function Login({ done }: { done: () => void }) {
   const [error, setError] = useState("");
@@ -35,7 +35,22 @@ function Providers() {
   const load = () => api<Provider[]>("/providers").then(setRows); useEffect(() => { void load(); }, []);
   function edit(provider?: Provider) { setEditing(provider?.id ?? 0); setForm(provider ? { kind: provider.kind, name: provider.name, endpoint: provider.endpoint, token: "", weight: provider.weight, enabled: provider.enabled } : emptyProvider); }
   async function save(event: FormEvent) { event.preventDefault(); const path = editing ? `/providers/${editing}` : "/providers"; await api(path, { method: editing ? "PUT" : "POST", body: JSON.stringify(form) }); setEditing(null); await load(); }
-  return <section><button onClick={() => edit()}>Add provider</button>{editing !== null && <form className="editor" onSubmit={save}><label>Name<input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required /></label><label>Adapter<select value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value as ProviderForm["kind"] })}><option value="searchix">Searchix</option><option value="tavily_hikari">Tavily Hikari</option></select></label><label>Endpoint<input type="url" value={form.endpoint} onChange={e => setForm({ ...form, endpoint: e.target.value })} required /></label><label>Token (write-only)<input type="password" value={form.token} onChange={e => setForm({ ...form, token: e.target.value })} required={!editing} placeholder={editing ? "Leave blank to retain" : "Required"} /></label><label>Weight<input type="number" min="1" value={form.weight} onChange={e => setForm({ ...form, weight: Number(e.target.value) })} /></label><label className="check"><input type="checkbox" checked={form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} /> Enabled</label><div><button>Save</button> <button type="button" className="secondary" onClick={() => setEditing(null)}>Cancel</button></div></form>}<div className="table"><div className="tr head"><span>Name</span><span>Adapter</span><span>Status</span><span>Weight</span><span /></div>{rows.map(provider => <div className="tr" key={provider.id}><span>{provider.name}<small>{provider.endpoint}</small></span><span>{provider.kind}</span><span className={provider.enabled ? "ok" : "warn"}>{provider.enabled ? "connected" : "disabled"}</span><span>{provider.weight}</span><span><button className="secondary" onClick={() => edit(provider)}>Edit</button></span></div>)}</div><p className="note">Enabled providers connect when the service starts or configuration is saved. Provider tokens are write-only.</p></section>;
+  return <section>
+    <button onClick={() => edit()}>Add provider</button>
+    {editing !== null && <form className="editor" onSubmit={save}><label>Name<input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required /></label><label>Adapter<select value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value as ProviderKind })}><option value={ProviderKind.Searchix}>Searchix</option><option value={ProviderKind.TavilyHikari}>Tavily Hikari</option></select></label><label>Endpoint<input type="url" value={form.endpoint} onChange={e => setForm({ ...form, endpoint: e.target.value })} required /></label><label>Token (write-only)<input type="password" value={form.token} onChange={e => setForm({ ...form, token: e.target.value })} required={!editing} placeholder={editing ? "Leave blank to retain" : "Required"} /></label><label>Weight<input type="number" min="1" value={form.weight} onChange={e => setForm({ ...form, weight: Number(e.target.value) })} /></label><label className="check"><input type="checkbox" checked={form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} /> Enabled</label><div><button>Save</button> <button type="button" className="secondary" onClick={() => setEditing(null)}>Cancel</button></div></form>}
+    <div className="table"><div className="tr head"><span>Name</span><span>Adapter</span><span>Status</span><span>Weight</span><span /></div>{rows.map(provider => { const status = !provider.enabled ? "disabled" : provider.connected ? "connected" : "unavailable"; return <div className="tr" key={provider.id}><span>{provider.name}<small>{provider.endpoint}</small></span><span>{provider.kind}</span><span className={provider.connected ? "ok" : "warn"}>{status}</span><span>{provider.weight}</span><span><button className="secondary" onClick={() => edit(provider)}>Edit</button></span></div>; })}</div>
+    <ToolMappingMatrix providers={rows} />
+    <p className="note">Mappings come from each connected provider's live tools/list response. Provider tokens are write-only.</p>
+  </section>;
+}
+
+function ToolMappingMatrix({ providers }: { providers: Provider[] }) {
+  const routeCount = providers.reduce((total, provider) => total + provider.tool_mappings.length, 0);
+  const connectedCount = providers.filter(provider => provider.connected).length;
+  return <section className="tool-map" aria-labelledby="tool-map-title">
+    <div className="tool-map-heading"><div><p className="eyebrow">LIVE CAPABILITIES</p><h3 id="tool-map-title">Tool routing map</h3></div><p><strong>{connectedCount}/{providers.length}</strong> providers active <span>·</span> <strong>{routeCount}</strong> routes</p></div>
+    {providers.length === 0 ? <div className="tool-map-empty">Add a provider to see how public tools map upstream.</div> : <div className="tool-map-scroll"><table><thead><tr><th scope="col">Public tool</th>{providers.map(provider => <th scope="col" key={provider.id}><span className={provider.connected ? "provider-dot live" : "provider-dot"} />{provider.name}<small>{provider.kind}</small></th>)}</tr></thead><tbody>{canonicalTools.map(tool => <tr key={tool}><th scope="row"><code>{tool}</code></th>{providers.map(provider => { const mapping = provider.tool_mappings.find(item => item.canonical_tool === tool); return <td key={provider.id}>{mapping ? <div className="mapping"><code>{mapping.upstream_tool}</code><small>{mapping.upstream_tool === tool ? "direct" : "alias"}</small></div> : <span className="unmapped">{!provider.enabled ? "Disabled" : !provider.connected ? "Unavailable" : "Not supported"}</span>}</td>; })}</tr>)}</tbody></table></div>}
+  </section>;
 }
 
 function Keys() {

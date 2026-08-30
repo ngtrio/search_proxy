@@ -114,7 +114,7 @@ impl Database {
         let overall = sqlx::query_as::<_, OverallMetric>(
             "SELECT COUNT(*) AS requests,
                     COALESCE(SUM(outcome = 'success'), 0) AS successes,
-                    COALESCE(AVG(duration_ms), 0) AS average_latency_ms
+                    CAST(COALESCE(AVG(duration_ms), 0) AS INTEGER) AS average_latency_ms
              FROM request_events
              WHERE started_at >= datetime('now', '-30 days')",
         )
@@ -126,7 +126,7 @@ impl Database {
                     COUNT(*) AS requests,
                     COALESCE(SUM(e.outcome = 'success'), 0) AS successes,
                     COALESCE(SUM(e.outcome <> 'success'), 0) AS failures,
-                    COALESCE(AVG(e.duration_ms), 0) AS average_latency_ms
+                    CAST(COALESCE(AVG(e.duration_ms), 0) AS INTEGER) AS average_latency_ms
              FROM request_events e
              JOIN providers p ON p.id = e.provider_id
              WHERE e.started_at >= datetime('now', '-30 days')
@@ -143,10 +143,10 @@ impl Database {
                         AS successes,
                     COALESCE(SUM(CASE WHEN outcome <> 'success' THEN requests ELSE 0 END), 0)
                         AS failures,
-                    CASE WHEN SUM(requests) > 0
-                         THEN SUM(duration_ms) / SUM(requests)
-                         ELSE 0
-                    END AS average_latency_ms
+                    CAST(CASE WHEN SUM(requests) > 0
+                              THEN SUM(duration_ms) / SUM(requests)
+                              ELSE 0
+                         END AS INTEGER) AS average_latency_ms
              FROM usage_daily
              WHERE day >= date('now', '-30 days')
              GROUP BY day

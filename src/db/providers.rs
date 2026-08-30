@@ -1,12 +1,20 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use super::Database;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum ProviderKind {
+    Searchix,
+    TavilyHikari,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct ProviderConfig {
     pub id: i64,
-    pub kind: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub endpoint: String,
     pub bearer_token: String,
@@ -17,7 +25,7 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ProviderSummary {
     pub id: i64,
-    pub kind: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub endpoint: String,
     pub weight: i64,
@@ -27,7 +35,7 @@ pub struct ProviderSummary {
 
 #[derive(Debug, Clone)]
 pub struct NewProvider {
-    pub kind: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub endpoint: String,
     pub bearer_token: String,
@@ -37,7 +45,7 @@ pub struct NewProvider {
 
 #[derive(Debug, Clone)]
 pub struct ProviderUpdate {
-    pub kind: String,
+    pub kind: ProviderKind,
     pub name: String,
     pub endpoint: String,
     pub bearer_token: Option<String>,

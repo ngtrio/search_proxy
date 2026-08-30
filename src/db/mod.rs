@@ -5,7 +5,7 @@ mod usage;
 
 pub use admin::{AdminCredentials, AdminSession};
 pub use client_keys::ClientKeySummary;
-pub use providers::{NewProvider, ProviderConfig, ProviderSummary, ProviderUpdate};
+pub use providers::{NewProvider, ProviderConfig, ProviderKind, ProviderSummary, ProviderUpdate};
 pub use usage::{DailyMetric, ProviderMetric, RequestRecord, RequestSummary, UsageOverview};
 
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};

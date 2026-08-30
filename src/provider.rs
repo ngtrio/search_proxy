@@ -4,6 +4,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
 use rmcp::service::RunningService;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
@@ -19,7 +20,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     catalog::canonical_tools,
-    db::{Database, NewProvider, ProviderConfig, ProviderUpdate, RequestRecord},
+    db::{Database, NewProvider, ProviderConfig, ProviderKind, ProviderUpdate, RequestRecord},
     mcp::SUPPORTED_PROTOCOL_VERSIONS,
     router::WeightedRandom,
 };
@@ -87,11 +88,17 @@ impl ProviderFailure {
 struct ConnectedProvider {
     id: i64,
     weight: i64,
-    kind: String,
+    kind: ProviderKind,
     endpoint: String,
     bearer_token: String,
     upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderToolMapping {
+    pub canonical_tool: String,
+    pub upstream_tool: String,
 }
 
 pub struct ProviderManager {
@@ -107,9 +114,10 @@ impl ProviderManager {
         };
         for provider in db.providers().await? {
             let description = format!("{} ({})", provider.name, provider.id);
-            if let Err(error) = registry.activate(provider).await {
-                tracing::warn!(%error, provider = description, "provider unavailable during startup");
-            }
+            registry
+                .activate(provider)
+                .await
+                .with_context(|| format!("failed to connect provider {description}"))?;
         }
         Ok(registry)
     }
@@ -118,7 +126,6 @@ impl ProviderManager {
     /// already-connected client into the live router.
     pub async fn create(&self, provider: NewProvider) -> Result<i64, ProviderMutationError> {
         validate_provider(
-            &provider.kind,
             &provider.name,
             &provider.endpoint,
             &provider.bearer_token,
@@ -127,7 +134,7 @@ impl ProviderManager {
         let prepared = if provider.enabled {
             Some(
                 connect(
-                    &provider.kind,
+                    provider.kind,
                     &provider.endpoint,
                     &provider.bearer_token,
                     canonical_tools(),
@@ -184,7 +191,6 @@ impl ProviderManager {
             enabled: update.enabled,
         };
         validate_provider(
-            &desired.kind,
             &desired.name,
             &desired.endpoint,
             &desired.bearer_token,
@@ -271,6 +277,27 @@ impl ProviderManager {
 
     pub fn tools(&self) -> &[Tool] {
         canonical_tools()
+    }
+
+    /// Returns the tool-name mappings advertised by a live provider. `None`
+    /// means the provider is not currently connected; an active provider only
+    /// contains mappings it actually advertised during `tools/list`.
+    pub fn tool_mappings(&self, id: i64) -> Option<Vec<ProviderToolMapping>> {
+        let provider = self.find(id)?;
+        Some(
+            canonical_tools()
+                .iter()
+                .filter_map(|tool| {
+                    provider
+                        .upstream_tools
+                        .get(tool.name.as_ref())
+                        .map(|upstream_tool| ProviderToolMapping {
+                            canonical_tool: tool.name.to_string(),
+                            upstream_tool: upstream_tool.clone(),
+                        })
+                })
+                .collect(),
+        )
     }
 
     pub async fn call_tool(
@@ -412,15 +439,11 @@ impl ProviderManager {
 }
 
 fn validate_provider(
-    kind: &str,
     name: &str,
     endpoint: &str,
     bearer_token: &str,
     weight: i64,
 ) -> Result<(), ProviderMutationError> {
-    if !["searchix", "tavily_hikari"].contains(&kind) {
-        return Err(ProviderMutationError::Invalid("unsupported provider kind"));
-    }
     if name.trim().is_empty() {
         return Err(ProviderMutationError::Invalid("name is required"));
     }
@@ -493,7 +516,7 @@ async fn connect_config(
     HashMap<String, String>,
 )> {
     connect(
-        &provider.kind,
+        provider.kind,
         &provider.endpoint,
         &provider.bearer_token,
         canonical_tools,
@@ -502,7 +525,7 @@ async fn connect_config(
 }
 
 async fn connect(
-    kind: &str,
+    kind: ProviderKind,
     endpoint: &str,
     bearer_token: &str,
     canonical_tools: &[rmcp::model::Tool],
@@ -584,14 +607,15 @@ impl MappedNameCandidate {
     }
 }
 
-fn mapped_name_candidates(kind: &str, canonical_name: &str) -> Vec<MappedNameCandidate> {
-    if kind == "searchix" {
-        vec![
+fn mapped_name_candidates(kind: ProviderKind, canonical_name: &str) -> Vec<MappedNameCandidate> {
+    match kind {
+        ProviderKind::Searchix => vec![
             MappedNameCandidate::Prefixed(format!("search_proxy_{canonical_name}")),
             MappedNameCandidate::Canonical(canonical_name.to_owned()),
-        ]
-    } else {
-        vec![MappedNameCandidate::Canonical(canonical_name.to_owned())]
+        ],
+        ProviderKind::TavilyHikari => {
+            vec![MappedNameCandidate::Canonical(canonical_name.to_owned())]
+        }
     }
 }
 
@@ -603,14 +627,14 @@ mod tests {
     fn provider_name_candidates_cover_every_canonical_tool() {
         for tool in canonical_tools() {
             assert_eq!(
-                mapped_name_candidates("searchix", tool.name.as_ref()),
+                mapped_name_candidates(ProviderKind::Searchix, tool.name.as_ref()),
                 vec![
                     MappedNameCandidate::Prefixed(format!("search_proxy_{}", tool.name)),
                     MappedNameCandidate::Canonical(tool.name.to_string()),
                 ]
             );
             assert_eq!(
-                mapped_name_candidates("tavily_hikari", tool.name.as_ref()),
+                mapped_name_candidates(ProviderKind::TavilyHikari, tool.name.as_ref()),
                 vec![MappedNameCandidate::Canonical(tool.name.to_string())]
             );
         }

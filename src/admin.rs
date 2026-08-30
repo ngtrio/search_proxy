@@ -7,14 +7,14 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     AppState,
     auth::{digest, hash_password, random_secret, verify_digest, verify_password},
-    db::{NewProvider, ProviderUpdate},
-    provider::ProviderMutationError,
+    db::{NewProvider, ProviderKind, ProviderSummary, ProviderUpdate},
+    provider::{ProviderMutationError, ProviderToolMapping},
 };
 
 pub fn routes() -> Router<AppState> {
@@ -257,9 +257,29 @@ async fn create_key(
         }
     }
 }
+#[derive(Serialize)]
+struct ProviderView {
+    #[serde(flatten)]
+    provider: ProviderSummary,
+    connected: bool,
+    tool_mappings: Vec<ProviderToolMapping>,
+}
+
 async fn providers(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.provider_summaries().await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|provider| {
+                    let tool_mappings = state.providers.tool_mappings(provider.id);
+                    ProviderView {
+                        connected: tool_mappings.is_some(),
+                        tool_mappings: tool_mappings.unwrap_or_default(),
+                        provider,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(error) => {
             tracing::error!(%error, "could not list providers");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -268,7 +288,7 @@ async fn providers(_auth: AdminRead, State(state): State<AppState>) -> impl Into
 }
 #[derive(Deserialize)]
 struct ProviderInput {
-    kind: String,
+    kind: ProviderKind,
     name: String,
     endpoint: String,
     token: Option<String>,

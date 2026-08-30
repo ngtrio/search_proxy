@@ -22,7 +22,7 @@ use tavily_mcp_gateway::{
     AppState, admin, app,
     auth::digest,
     catalog::canonical_tools,
-    db::{Database, NewProvider, ProviderUpdate},
+    db::{Database, NewProvider, ProviderKind, ProviderUpdate, RequestRecord},
     provider::ProviderManager,
 };
 use tower::ServiceExt;
@@ -418,6 +418,8 @@ async fn admin_csrf_and_repeatable_client_keys() {
     assert!(!encoded.contains("upstream-secret"));
     assert!(!encoded.contains("bearer_token"));
     assert_eq!(listed[0]["token_configured"], true);
+    assert_eq!(listed[0]["connected"], false);
+    assert_eq!(listed[0]["tool_mappings"], json!([]));
 
     let created_key_response = gateway
         .clone()
@@ -650,6 +652,40 @@ async fn tool_calls_write_metadata_and_daily_aggregates_only() {
 }
 
 #[tokio::test]
+async fn usage_overview_decodes_average_latency_from_sqlite() {
+    let (state, _dir) = state().await;
+    let client_key_id = state
+        .db
+        .create_client_key(
+            "average",
+            "tmg_average",
+            &digest("average-secret"),
+            "average-secret",
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .record_request(RequestRecord {
+            id: "average-request",
+            client_key_id,
+            provider_id: None,
+            duration_ms: 101,
+            outcome: "success",
+            error_category: None,
+        })
+        .await
+        .unwrap();
+
+    let overview = state
+        .db
+        .usage_overview()
+        .await
+        .expect("usage overview should decode SQLite AVG");
+    assert_eq!(overview.average_latency_ms, 101);
+}
+
+#[tokio::test]
 async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     let mock = MockSearchix::default();
     mock.advertise_all_tools
@@ -675,7 +711,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     let provider_id = state
         .providers
         .create(NewProvider {
-            kind: "searchix".into(),
+            kind: ProviderKind::Searchix,
             name: "mock".into(),
             endpoint: endpoint.clone(),
             bearer_token: "test".into(),
@@ -737,7 +773,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
         .update_config(
             provider_id,
             ProviderUpdate {
-                kind: "searchix".into(),
+                kind: ProviderKind::Searchix,
                 name: "unreachable replacement".into(),
                 endpoint: format!("http://{closed_address}/mcp"),
                 bearer_token: None,
@@ -763,14 +799,14 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
 }
 
 #[tokio::test]
-async fn failed_provider_connections_do_not_poison_persistence_or_startup() {
+async fn failed_provider_connections_abort_startup() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
 
     let (state, _dir) = state().await;
     let unreachable = NewProvider {
-        kind: "searchix".into(),
+        kind: ProviderKind::Searchix,
         name: "unreachable".into(),
         endpoint: format!("http://{address}/mcp"),
         bearer_token: "test".into(),
@@ -781,14 +817,16 @@ async fn failed_provider_connections_do_not_poison_persistence_or_startup() {
     assert!(state.db.provider_summaries().await.unwrap().is_empty());
 
     state.db.create_provider(unreachable).await.unwrap();
-    let loaded = ProviderManager::new(state.db.clone())
-        .await
-        .expect("an unavailable provider must not prevent the control plane from starting");
-    let failure = loaded
-        .call("tavily_search", serde_json::Map::new())
-        .await
-        .unwrap_err();
-    assert_eq!(failure.provider_id, None);
+    let startup = ProviderManager::new(state.db.clone()).await;
+    let error = match startup {
+        Ok(_) => panic!("an unavailable provider must prevent startup"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("failed to connect provider unreachable (1)")
+    );
 }
 
 #[tokio::test]
@@ -845,6 +883,7 @@ async fn enabled_provider_creation_connects_before_activation() {
         .find_map(|value| value.strip_prefix("gateway_csrf="))
         .unwrap();
     let created = gateway
+        .clone()
         .oneshot(
             Request::post("/admin/api/providers")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -868,6 +907,24 @@ async fn enabled_provider_creation_connects_before_activation() {
     assert_eq!(created.status(), StatusCode::CREATED);
     let created = body_json(created).await;
     assert!(created["id"].is_number());
+    let listed = gateway
+        .oneshot(
+            Request::get("/admin/api/providers")
+                .header(header::COOKIE, cookies.join("; "))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed = body_json(listed).await;
+    assert_eq!(listed[0]["connected"], true);
+    assert_eq!(
+        listed[0]["tool_mappings"],
+        json!([{
+            "canonical_tool": "tavily_search",
+            "upstream_tool": "search_proxy_tavily_search"
+        }])
+    );
     let mut arguments = serde_json::Map::new();
     arguments.insert("provider_specific".into(), json!(true));
     let (_, result) = state

@@ -1,4 +1,11 @@
-export type Provider = { id: number; kind: "searchix" | "tavily_hikari"; name: string; endpoint: string; weight: number; enabled: boolean; token_configured: boolean };
+export enum ProviderKind {
+  Searchix = "searchix",
+  TavilyHikari = "tavily_hikari",
+}
+export const canonicalTools = ["tavily_search", "tavily_extract", "tavily_crawl", "tavily_map", "tavily_research"] as const;
+export type CanonicalTool = typeof canonicalTools[number];
+export type ToolMapping = { canonical_tool: CanonicalTool; upstream_tool: string };
+export type Provider = { id: number; kind: ProviderKind; name: string; endpoint: string; weight: number; enabled: boolean; connected: boolean; token_configured: boolean; tool_mappings: ToolMapping[] };
 export type ClientKey = { id: number; name: string; prefix: string; status: string; created_at: string; last_used_at: string | null; request_count: number; key: string | null };
 export type RequestEvent = { request_id: string; client_key_prefix: string | null; client_key_name: string | null; provider: string | null; started_at: string; duration_ms: number; outcome: string; error_category: string | null };
 export type Metric = { requests: number; successes: number; failures: number; average_latency_ms: number };
