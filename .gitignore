@@ -3,6 +3,7 @@
 /web/node_modules
 /web/dist
 /web/.output
+/web/.tanstack
 /data
 *.db
 *.db-shm
