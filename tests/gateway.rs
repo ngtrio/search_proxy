@@ -160,7 +160,7 @@ async fn mcp_requires_auth_and_negotiates_all_legacy_revisions() {
     let secret = "tmg_test-secret";
     state
         .db
-        .create_client_key("test", "tmg_test", &digest(secret))
+        .create_client_key("test", "tmg_test", &digest(secret), secret)
         .await
         .unwrap();
     let gateway = app(state);
@@ -219,7 +219,7 @@ async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
     let secret = "tmg_catalog";
     state
         .db
-        .create_client_key("catalog", "tmg_catalog", &digest(secret))
+        .create_client_key("catalog", "tmg_catalog", &digest(secret), secret)
         .await
         .unwrap();
     let gateway = app(state);
@@ -322,7 +322,7 @@ async fn modern_discovery_is_stateless() {
     let secret = "tmg_modern";
     state
         .db
-        .create_client_key("modern", "tmg_modern", &digest(secret))
+        .create_client_key("modern", "tmg_modern", &digest(secret), secret)
         .await
         .unwrap();
     let body = json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}).to_string();
@@ -345,7 +345,7 @@ async fn modern_discovery_is_stateless() {
 }
 
 #[tokio::test]
-async fn admin_csrf_write_only_tokens() {
+async fn admin_csrf_and_repeatable_client_keys() {
     let (state, _dir) = state().await;
     let gateway = app(state.clone());
     let login_body =
@@ -418,6 +418,34 @@ async fn admin_csrf_write_only_tokens() {
     assert!(!encoded.contains("upstream-secret"));
     assert!(!encoded.contains("bearer_token"));
     assert_eq!(listed[0]["token_configured"], true);
+
+    let created_key_response = gateway
+        .clone()
+        .oneshot(
+            Request::post("/admin/api/keys")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header("x-csrf-token", csrf)
+                .body(Body::from(json!({"name":"repeatable"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_key_response.status(), StatusCode::CREATED);
+    let created_key = body_json(created_key_response).await;
+    let original_key = created_key["key"].as_str().unwrap().to_owned();
+    let listed_keys = gateway
+        .clone()
+        .oneshot(
+            Request::get("/admin/api/keys")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed_keys = body_json(listed_keys).await;
+    assert_eq!(listed_keys[0]["key"].as_str(), Some(original_key.as_str()));
 }
 
 #[tokio::test]
@@ -483,7 +511,7 @@ async fn tool_calls_write_metadata_and_daily_aggregates_only() {
     let secret = "tmg_usage";
     state
         .db
-        .create_client_key("usage", "tmg_usage", &digest(secret))
+        .create_client_key("usage", "tmg_usage", &digest(secret), secret)
         .await
         .unwrap();
     let gateway = app(state.clone());

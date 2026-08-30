@@ -23,7 +23,6 @@ pub fn routes() -> Router<AppState> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/keys", get(keys).post(create_key))
-        .route("/keys/{id}/revoke", post(revoke_key))
         .route("/providers", get(providers).post(create_provider))
         .route("/providers/{id}", put(update_provider))
         .route("/overview", get(overview))
@@ -227,6 +226,7 @@ async fn keys(_auth: AdminRead, State(state): State<AppState>) -> impl IntoRespo
         }
     }
 }
+
 #[derive(Deserialize)]
 struct Name {
     name: String,
@@ -243,7 +243,7 @@ async fn create_key(
     let prefix = secret.chars().take(12).collect::<String>();
     match state
         .db
-        .create_client_key(&input.name, &prefix, &digest(&secret))
+        .create_client_key(&input.name, &prefix, &digest(&secret), &secret)
         .await
     {
         Ok(id) => (
@@ -257,20 +257,6 @@ async fn create_key(
         }
     }
 }
-async fn revoke_key(
-    _auth: AdminWrite,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
-    match state.db.revoke_client_key(id).await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(error) => {
-            tracing::error!(%error, "could not revoke client API key");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
-}
-
 async fn providers(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.provider_summaries().await {
         Ok(rows) => Json(rows).into_response(),

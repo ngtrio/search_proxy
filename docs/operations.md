@@ -1,6 +1,6 @@
 # Operations
 
-The gateway is a single-process service. Its SQLite database contains plaintext upstream tokens by explicit design; protect the data volume and every backup as credentials.
+The gateway is a single-process service. Its SQLite database contains plaintext upstream tokens and client API keys by explicit design; active client API keys are also visible to authenticated administrators in the key list. Protect the data volume and every backup as credentials.
 
 ## Deploy
 
@@ -48,7 +48,7 @@ chmod 600 /data/backup-*.db
 sqlite3 /data/backup-2026-08-27.db 'PRAGMA integrity_check;'
 ```
 
-Copy the backup to access-controlled encrypted storage. A backup contains plaintext provider tokens.
+Copy the backup to access-controlled encrypted storage. A backup contains plaintext provider tokens and client API keys.
 
 To exercise restore, stop the gateway, preserve the current database files, copy a verified backup to a new `gateway.db`, set ownership/permissions, and start the gateway. Confirm migrations, login, key metadata, provider records, and liveness. Do not restore over a running WAL database.
 

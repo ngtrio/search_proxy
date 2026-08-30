@@ -39,9 +39,10 @@ function Providers() {
 }
 
 function Keys() {
-  const [rows, setRows] = useState<ClientKey[]>([]); const [revealed, setRevealed] = useState(""); const load = () => api<ClientKey[]>("/keys").then(setRows); useEffect(() => { void load(); }, []);
-  async function create() { const name = prompt("Key name"); if (name) { const result = await api<{ key: string }>("/keys", { method: "POST", body: JSON.stringify({ name }) }); setRevealed(result.key); void load(); } }
-  return <section><button onClick={create}>Create key</button>{revealed && <div className="reveal"><strong>Copy now. This key will not be shown again.</strong><code>{revealed}</code></div>}<div className="table">{rows.map(key => <div className="tr key" key={key.id}><span>{key.name}<small>{key.prefix}…</small></span><span>{key.status}</span><span>{key.request_count} calls</span><button onClick={() => api(`/keys/${key.id}/revoke`, { method: "POST", body: "{}" }).then(load)}>Revoke</button></div>)}</div></section>;
+  const [rows, setRows] = useState<ClientKey[]>([]); const [error, setError] = useState(""); const load = () => api<ClientKey[]>("/keys").then(setRows); useEffect(() => { void load(); }, []);
+  async function create() { const name = prompt("Key name"); if (name) { try { await api<{ key: string }>("/keys", { method: "POST", body: JSON.stringify({ name }) }); setError(""); void load(); } catch { setError("Could not create key"); } } }
+  async function copyKey(value: string) { try { if (!navigator.clipboard) throw new Error(); await navigator.clipboard.writeText(value); setError(""); } catch { setError("Copy failed. Select the key manually."); } }
+  return <section><button onClick={create}>Create key</button>{error && <p className="error">{error}</p>}<div className="table">{rows.map(key => <div className="tr key" key={key.id}><span>{key.name}<small>{key.key ?? `${key.prefix}…`}</small></span><span>{key.status}</span><span>{key.request_count} calls</span><button className="secondary" disabled={!key.key} onClick={() => key.key && void copyKey(key.key)}>Copy</button></div>)}</div><p className="note">Active client API keys are shown in the list and can be copied again. Keys created before repeat-copy support must be replaced.</p></section>;
 }
 
 function Requests() {
