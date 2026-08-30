@@ -5,14 +5,15 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use rmcp::service::RunningService;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientInfo,
-        PaginatedRequestParams, ProtocolVersion,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientInfo, ContentBlock,
+        PaginatedRequestParams, ProtocolVersion, Tool,
     },
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -22,9 +23,15 @@ use serde_json::{Map, Value};
 
 use crate::{
     catalog::canonical_tools,
-    db::{Database, NewProvider, ProviderConfig, ProviderUpdate},
+    db::{Database, NewProvider, ProviderConfig, ProviderUpdate, RequestRecord},
     router::WeightedRandom,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolCallError {
+    #[error("unknown tool")]
+    UnknownTool,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -286,6 +293,56 @@ impl ProviderManager {
             .is_empty()
     }
 
+    pub fn tools(&self) -> &[Tool] {
+        canonical_tools()
+    }
+
+    pub async fn call_tool(
+        &self,
+        client_key_id: i64,
+        tool_name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<CallToolResult, ToolCallError> {
+        if !canonical_tools().iter().any(|tool| tool.name == tool_name) {
+            return Err(ToolCallError::UnknownTool);
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let started = Instant::now();
+        if let Err(error) = self.db.mark_client_key_used(client_key_id).await {
+            tracing::warn!(%error, client_key_id, "could not update client API key usage");
+        }
+
+        let result = match self.call(tool_name, arguments).await {
+            Ok((provider_id, result)) => {
+                let provider_error = result.is_error.unwrap_or(false);
+                self.record(
+                    &request_id,
+                    client_key_id,
+                    Some(provider_id),
+                    started.elapsed().as_millis() as i64,
+                    if provider_error { "failure" } else { "success" },
+                    provider_error.then_some("upstream_tool_error"),
+                )
+                .await;
+                result
+            }
+            Err(error) => {
+                self.record(
+                    &request_id,
+                    client_key_id,
+                    error.provider_id,
+                    started.elapsed().as_millis() as i64,
+                    "failure",
+                    Some(error.category()),
+                )
+                .await;
+                CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+            }
+        };
+        Ok(result)
+    }
+
     pub async fn call(
         &self,
         tool_name: &str,
@@ -323,6 +380,40 @@ impl ProviderManager {
                 }
                 Err(ProviderFailure::after_routing(id, returned))
             }
+        }
+    }
+
+    async fn record(
+        &self,
+        request_id: &str,
+        client_key_id: i64,
+        provider_id: Option<i64>,
+        duration_ms: i64,
+        outcome: &str,
+        error_category: Option<&str>,
+    ) {
+        tracing::info!(
+            request_id,
+            client_key_id,
+            provider_id,
+            duration_ms,
+            outcome,
+            error_category,
+            "canonical tool call completed"
+        );
+        if let Err(error) = self
+            .db
+            .record_request(RequestRecord {
+                id: request_id,
+                client_key_id,
+                provider_id,
+                duration_ms,
+                outcome,
+                error_category,
+            })
+            .await
+        {
+            tracing::error!(%error, request_id, "could not persist tool call metadata");
         }
     }
 

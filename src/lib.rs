@@ -3,7 +3,6 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod db;
-pub mod gateway;
 pub mod mcp;
 pub mod provider;
 mod router;
@@ -12,14 +11,12 @@ use std::sync::Arc;
 
 use axum::{Router, routing::get};
 use db::Database;
-use gateway::ToolGateway;
 use provider::ProviderManager;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub providers: Arc<ProviderManager>,
-    pub gateway: Arc<ToolGateway>,
 }
 
 pub fn app(state: AppState) -> Router {

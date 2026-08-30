@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::{AppState, auth::digest, gateway::ToolGatewayError};
+use crate::{AppState, auth::digest, provider::ToolCallError};
 use axum::{
     Router,
     body::Body,
@@ -52,7 +52,7 @@ impl ServerHandler for GatewayHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            self.state.gateway.tools().to_vec(),
+            self.state.providers.tools().to_vec(),
         )))
     }
 
@@ -72,14 +72,12 @@ impl ServerHandler for GatewayHandler {
         let arguments = request.arguments.unwrap_or_default();
         match self
             .state
-            .gateway
-            .call(client_key_id, request.name.as_ref(), arguments)
+            .providers
+            .call_tool(client_key_id, request.name.as_ref(), arguments)
             .await
         {
             Ok(result) => Ok(result.into()),
-            Err(ToolGatewayError::UnknownTool) => {
-                Err(ErrorData::invalid_params("unknown tool", None))
-            }
+            Err(ToolCallError::UnknownTool) => Err(ErrorData::invalid_params("unknown tool", None)),
         }
     }
 }

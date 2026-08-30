@@ -23,7 +23,6 @@ use tavily_mcp_gateway::{
     auth::digest,
     catalog::canonical_tools,
     db::{Database, NewProvider, ProviderUpdate},
-    gateway::ToolGateway,
     provider::ProviderManager,
 };
 use tower::ServiceExt;
@@ -122,12 +121,7 @@ async fn state() -> (AppState, tempfile::TempDir) {
             .await
             .expect("load providers"),
     );
-    let tool_gateway = Arc::new(ToolGateway::new(db.clone(), Arc::clone(&providers)));
-    let state = AppState {
-        db,
-        providers,
-        gateway: tool_gateway,
-    };
+    let state = AppState { db, providers };
     admin::bootstrap(&state.db, "admin", Some("correct horse battery staple"))
         .await
         .expect("bootstrap");
@@ -664,7 +658,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
         })
         .await
         .unwrap();
-    for tool in state.gateway.tools() {
+    for tool in state.providers.tools() {
         let mut arguments = serde_json::Map::new();
         arguments.insert("provider_specific".into(), json!(true));
         let (_, result) = state
@@ -680,7 +674,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     }
     assert_eq!(
         mock.calls.load(std::sync::atomic::Ordering::SeqCst),
-        state.gateway.tools().len()
+        state.providers.tools().len()
     );
     mock.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut arguments = serde_json::Map::new();
@@ -693,7 +687,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     assert_eq!(failure.provider_id, Some(provider_id));
     assert_eq!(
         mock.calls.load(std::sync::atomic::Ordering::SeqCst),
-        state.gateway.tools().len() + 1
+        state.providers.tools().len() + 1
     );
     assert_eq!(
         mock.last_tool.lock().unwrap().as_deref(),
