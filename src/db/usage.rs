@@ -4,6 +4,49 @@ use sqlx::FromRow;
 use super::Database;
 
 #[derive(Debug, Clone, Copy)]
+pub struct MetricsWindow {
+    pub start: i64,
+    pub end: i64,
+    pub previous_start: i64,
+    pub bucket_seconds: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct MetricBucket {
+    pub timestamp: String,
+    pub requests: i64,
+    pub failures: i64,
+    pub p50_ms: Option<i64>,
+    pub p95_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct ActivityBucket {
+    pub timestamp: String,
+    pub requests: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct LatencyBucket {
+    pub timestamp: String,
+    pub p5_ms: Option<i64>,
+    pub p50_ms: Option<i64>,
+    pub p95_ms: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+pub struct MetricSummaryRow {
+    pub current_requests: i64,
+    pub current_successes: i64,
+    pub current_p50: Option<i64>,
+    pub current_p95: Option<i64>,
+    pub previous_requests: i64,
+    pub previous_successes: i64,
+    pub previous_p50: Option<i64>,
+    pub previous_p95: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct RequestRecord<'a> {
     pub id: &'a str,
     pub client_key_id: i64,
@@ -61,6 +104,144 @@ struct OverallMetric {
 }
 
 impl Database {
+    pub async fn metric_summary(
+        &self,
+        window: &MetricsWindow,
+    ) -> Result<MetricSummaryRow, sqlx::Error> {
+        sqlx::query_as::<_, MetricSummaryRow>(
+            "WITH scoped AS (
+                SELECT duration_ms, outcome,
+                       CASE WHEN CAST(strftime('%s', started_at) AS INTEGER) >= ? THEN 1 ELSE 0 END AS current_period
+                FROM request_events
+                WHERE CAST(strftime('%s', started_at) AS INTEGER) >= ?
+                  AND CAST(strftime('%s', started_at) AS INTEGER) < ?
+             ), ranked AS (
+                SELECT duration_ms, outcome, current_period,
+                       ROW_NUMBER() OVER (PARTITION BY current_period ORDER BY duration_ms) AS rn,
+                       COUNT(*) OVER (PARTITION BY current_period) AS cnt
+                FROM scoped
+             )
+             SELECT
+                COALESCE(SUM(current_period = 1), 0) AS current_requests,
+                COALESCE(SUM(current_period = 1 AND outcome = 'success'), 0) AS current_successes,
+                MAX(CASE WHEN current_period = 1 AND rn = (cnt + 1) / 2 THEN duration_ms END) AS current_p50,
+                MAX(CASE WHEN current_period = 1 AND rn = (cnt * 95 + 99) / 100 THEN duration_ms END) AS current_p95,
+                COALESCE(SUM(current_period = 0), 0) AS previous_requests,
+                COALESCE(SUM(current_period = 0 AND outcome = 'success'), 0) AS previous_successes,
+                MAX(CASE WHEN current_period = 0 AND rn = (cnt + 1) / 2 THEN duration_ms END) AS previous_p50,
+                MAX(CASE WHEN current_period = 0 AND rn = (cnt * 95 + 99) / 100 THEN duration_ms END) AS previous_p95
+             FROM ranked",
+        )
+        .bind(window.start)
+        .bind(window.previous_start)
+        .bind(window.end)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn metric_series(
+        &self,
+        window: &MetricsWindow,
+    ) -> Result<Vec<MetricBucket>, sqlx::Error> {
+        sqlx::query_as::<_, MetricBucket>(
+            "WITH RECURSIVE buckets(n, bucket_start) AS (
+                SELECT 0, ?
+                UNION ALL
+                SELECT n + 1, bucket_start + ? FROM buckets
+                WHERE bucket_start + ? < ?
+             ), events AS (
+                SELECT CAST((CAST(strftime('%s', started_at) AS INTEGER) - ?) / ? AS INTEGER) AS bucket,
+                       duration_ms, outcome
+                FROM request_events
+                WHERE CAST(strftime('%s', started_at) AS INTEGER) >= ?
+                  AND CAST(strftime('%s', started_at) AS INTEGER) < ?
+             ), ranked AS (
+                SELECT bucket, duration_ms, outcome,
+                       ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY duration_ms) AS rn,
+                       COUNT(*) OVER (PARTITION BY bucket) AS cnt
+                FROM events
+             ), aggregate AS (
+                SELECT bucket, COUNT(*) AS requests,
+                       SUM(outcome <> 'success') AS failures,
+                       MAX(CASE WHEN rn = (cnt + 1) / 2 THEN duration_ms END) AS p50_ms,
+                       MAX(CASE WHEN rn = (cnt * 95 + 99) / 100 THEN duration_ms END) AS p95_ms
+                FROM ranked GROUP BY bucket
+             )
+             SELECT strftime('%Y-%m-%dT%H:%M:%SZ', b.bucket_start, 'unixepoch') AS timestamp,
+                    COALESCE(a.requests, 0) AS requests,
+                    COALESCE(a.failures, 0) AS failures,
+                    a.p50_ms, a.p95_ms
+             FROM buckets b LEFT JOIN aggregate a ON a.bucket = b.n ORDER BY b.n",
+        )
+        .bind(window.start)
+        .bind(window.bucket_seconds)
+        .bind(window.bucket_seconds)
+        .bind(window.end)
+        .bind(window.start)
+        .bind(window.bucket_seconds)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn activity_series(
+        &self,
+        window: &MetricsWindow,
+    ) -> Result<Vec<ActivityBucket>, sqlx::Error> {
+        sqlx::query_as::<_, ActivityBucket>(
+            "WITH RECURSIVE buckets(n, bucket_start) AS (
+                SELECT 0, ? UNION ALL SELECT n + 1, bucket_start + ? FROM buckets
+                WHERE bucket_start + ? < ?
+             ), aggregate AS (
+                SELECT CAST((CAST(strftime('%s', started_at) AS INTEGER) - ?) / ? AS INTEGER) AS bucket,
+                       COUNT(*) AS requests
+                FROM request_events
+                WHERE CAST(strftime('%s', started_at) AS INTEGER) >= ?
+                  AND CAST(strftime('%s', started_at) AS INTEGER) < ? GROUP BY bucket
+             )
+             SELECT strftime('%Y-%m-%dT%H:%M:%SZ', b.bucket_start, 'unixepoch') AS timestamp,
+                    COALESCE(a.requests, 0) AS requests
+             FROM buckets b LEFT JOIN aggregate a ON a.bucket = b.n ORDER BY b.n",
+        )
+        .bind(window.start).bind(window.bucket_seconds).bind(window.bucket_seconds).bind(window.end)
+        .bind(window.start).bind(window.bucket_seconds).bind(window.start).bind(window.end)
+        .fetch_all(&self.pool).await
+    }
+
+    pub async fn latency_distribution(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<LatencyBucket>, sqlx::Error> {
+        sqlx::query_as::<_, LatencyBucket>(
+            "WITH RECURSIVE buckets(n, bucket_start) AS (
+                SELECT 0, ? UNION ALL SELECT n + 1, bucket_start + 3600 FROM buckets
+                WHERE bucket_start + 3600 < ?
+             ), events AS (
+                SELECT CAST((CAST(strftime('%s', started_at) AS INTEGER) - ?) / 3600 AS INTEGER) AS bucket,
+                       duration_ms FROM request_events
+                WHERE CAST(strftime('%s', started_at) AS INTEGER) >= ?
+                  AND CAST(strftime('%s', started_at) AS INTEGER) < ?
+             ), ranked AS (
+                SELECT bucket, duration_ms,
+                       ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY duration_ms) AS rn,
+                       COUNT(*) OVER (PARTITION BY bucket) AS cnt FROM events
+             ), aggregate AS (
+                SELECT bucket,
+                       MAX(CASE WHEN rn = (cnt * 5 + 99) / 100 THEN duration_ms END) AS p5_ms,
+                       MAX(CASE WHEN rn = (cnt + 1) / 2 THEN duration_ms END) AS p50_ms,
+                       MAX(CASE WHEN rn = (cnt * 95 + 99) / 100 THEN duration_ms END) AS p95_ms
+                FROM ranked GROUP BY bucket
+             )
+             SELECT strftime('%Y-%m-%dT%H:%M:%SZ', b.bucket_start, 'unixepoch') AS timestamp,
+                    a.p5_ms, a.p50_ms, a.p95_ms
+             FROM buckets b LEFT JOIN aggregate a ON a.bucket = b.n ORDER BY b.n",
+        )
+        .bind(start).bind(end).bind(start).bind(start).bind(end)
+        .fetch_all(&self.pool).await
+    }
+
     pub async fn record_request(&self, record: RequestRecord<'_>) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
 

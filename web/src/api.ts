@@ -11,6 +11,27 @@ export type RequestEvent = { request_id: string; client_key_prefix: string | nul
 export type Metric = { requests: number; successes: number; failures: number; average_latency_ms: number };
 export type OverviewData = Metric & { providers: Array<Metric & { provider: string }>; daily: Array<Metric & { day: string }> };
 
+export const metricWindows = ["1h", "24h", "7d", "30d"] as const;
+export type MetricWindow = typeof metricWindows[number];
+export type ComparedMetric<T> = { value: T; change: number | null };
+export type MetricBucket = { timestamp: string; requests: number; failures: number; p50_ms: number | null; p95_ms: number | null };
+export type ActivityBucket = { timestamp: string; requests: number };
+export type LatencyBucket = { timestamp: string; p5_ms: number | null; p50_ms: number | null; p95_ms: number | null };
+export type MetricsData = {
+  window: MetricWindow;
+  generated_at: string;
+  timezone: "UTC";
+  summary: {
+    requests: ComparedMetric<number>;
+    success_rate: ComparedMetric<number | null>;
+    p50_ms: ComparedMetric<number | null>;
+    p95_ms: ComparedMetric<number | null>;
+  };
+  series: MetricBucket[];
+  activity: ActivityBucket[];
+  latency_distribution: LatencyBucket[];
+};
+
 let csrf = "";
 const csrfStorageKey = "tavily-gateway-csrf";
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");

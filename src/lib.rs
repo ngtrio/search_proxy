@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod mcp;
+pub mod metrics;
 pub mod provider;
 mod router;
 
@@ -36,11 +37,14 @@ pub struct AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    let admin_routes = admin::routes().layer(admin::cors_layer(&state.admin));
+    let api_routes = Router::new()
+        .route("/metrics", get(metrics::handler))
+        .merge(admin::routes())
+        .layer(admin::cors_layer(&state.admin));
 
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
         .nest("/mcp", mcp::routes(state.clone()))
-        .nest("/api", admin_routes)
+        .nest("/api", api_routes)
         .with_state(state)
 }

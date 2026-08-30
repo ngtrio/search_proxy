@@ -142,6 +142,79 @@ async fn body_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
+#[tokio::test]
+async fn public_metrics_are_aggregated_validated_and_anonymous() {
+    let (state, _dir) = state().await;
+    let key_id = state
+        .db
+        .create_client_key(
+            "metrics-test",
+            "tmg_metric",
+            &digest("metrics-secret"),
+            "metrics-secret",
+        )
+        .await
+        .unwrap();
+    for (index, duration_ms) in [10, 20, 30, 40].into_iter().enumerate() {
+        let request_id = format!("metric-{index}");
+        state
+            .db
+            .record_request(RequestRecord {
+                id: &request_id,
+                client_key_id: key_id,
+                provider_id: None,
+                duration_ms,
+                outcome: if index == 3 { "error" } else { "success" },
+                error_category: (index == 3).then_some("private-error"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let gateway = app(state);
+    let response = gateway
+        .clone()
+        .oneshot(
+            Request::get("/api/metrics?window=1h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = body_json(response).await;
+    assert_eq!(metrics["window"], "1h");
+    assert_eq!(metrics["summary"]["requests"]["value"], 4);
+    assert_eq!(metrics["summary"]["success_rate"]["value"], 75.0);
+    assert_eq!(metrics["summary"]["p50_ms"]["value"], 20);
+    assert_eq!(metrics["summary"]["p95_ms"]["value"], 40);
+    assert_eq!(metrics["series"].as_array().unwrap().len(), 60);
+    assert_eq!(metrics["activity"].as_array().unwrap().len(), 288);
+    assert_eq!(
+        metrics["latency_distribution"].as_array().unwrap().len(),
+        24
+    );
+    let serialized = metrics.to_string();
+    for sensitive in [
+        "metrics-secret",
+        "metrics-test",
+        "private-error",
+        "provider",
+    ] {
+        assert!(!serialized.contains(sensitive));
+    }
+
+    let invalid = gateway
+        .oneshot(
+            Request::get("/api/metrics?window=2h")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
 async fn body_sse_json(response: axum::response::Response) -> Value {
     let bytes = response
         .into_body()

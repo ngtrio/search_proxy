@@ -9,7 +9,8 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Tavily Gateway" },
+      { title: "Search Proxy | 请求监控" },
+      { name: "theme-color", content: "#0b0d0e" },
     ],
   }),
   component: RootDocument,
@@ -21,7 +22,7 @@ function RootDocument() {
       new QueryClient({
         defaultOptions: {
           queries: {
-            staleTime: 30_000,
+            staleTime: 60_000,
             retry: 1,
           },
         },
@@ -29,7 +30,7 @@ function RootDocument() {
   );
 
   return (
-    <html lang="en">
+    <html lang="zh-CN" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
