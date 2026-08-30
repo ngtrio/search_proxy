@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
     time::Instant,
@@ -546,8 +545,8 @@ async fn connect(
             .filter_map(|tool| {
                 mapped_name_candidates(kind, tool.name.as_ref())
                     .into_iter()
-                    .find(|upstream_name| upstream_names.contains(upstream_name.as_ref()))
-                    .map(|upstream_name| (tool.name.to_string(), upstream_name.into_owned()))
+                    .find(|candidate| upstream_names.contains(candidate.as_str()))
+                    .map(|candidate| (tool.name.to_string(), candidate.into_string()))
             })
             .collect::<HashMap<_, _>>();
         if mapped.is_empty() {
@@ -565,14 +564,34 @@ async fn connect(
     }
 }
 
-fn mapped_name_candidates<'a>(kind: &str, canonical_name: &'a str) -> Vec<Cow<'a, str>> {
+#[derive(Debug, PartialEq, Eq)]
+enum MappedNameCandidate {
+    Prefixed(String),
+    Canonical(String),
+}
+
+impl MappedNameCandidate {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Prefixed(name) | Self::Canonical(name) => name,
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Self::Prefixed(name) | Self::Canonical(name) => name,
+        }
+    }
+}
+
+fn mapped_name_candidates(kind: &str, canonical_name: &str) -> Vec<MappedNameCandidate> {
     if kind == "searchix" {
         vec![
-            Cow::Owned(format!("search_proxy_{canonical_name}")),
-            Cow::Borrowed(canonical_name),
+            MappedNameCandidate::Prefixed(format!("search_proxy_{canonical_name}")),
+            MappedNameCandidate::Canonical(canonical_name.to_owned()),
         ]
     } else {
-        vec![Cow::Borrowed(canonical_name)]
+        vec![MappedNameCandidate::Canonical(canonical_name.to_owned())]
     }
 }
 
@@ -585,11 +604,14 @@ mod tests {
         for tool in canonical_tools() {
             assert_eq!(
                 mapped_name_candidates("searchix", tool.name.as_ref()),
-                [format!("search_proxy_{}", tool.name), tool.name.to_string()]
+                vec![
+                    MappedNameCandidate::Prefixed(format!("search_proxy_{}", tool.name)),
+                    MappedNameCandidate::Canonical(tool.name.to_string()),
+                ]
             );
             assert_eq!(
                 mapped_name_candidates("tavily_hikari", tool.name.as_ref()),
-                [tool.name.to_string()]
+                vec![MappedNameCandidate::Canonical(tool.name.to_string())]
             );
         }
     }
