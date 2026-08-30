@@ -18,6 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN useradd --system --uid 10001 gateway && mkdir /data && chown gateway:gateway /data
 COPY --from=rust /app/target/release/tavily-mcp-gateway /usr/local/bin/gateway
 USER gateway
-ENV GATEWAY_ENV=production DATABASE_URL=sqlite:///data/gateway.db?mode=rwc GATEWAY_BIND=0.0.0.0:3000
+ENV DATABASE_URL=sqlite:///data/gateway.db?mode=rwc GATEWAY_BIND=0.0.0.0:3000
 EXPOSE 3000
 ENTRYPOINT ["gateway"]

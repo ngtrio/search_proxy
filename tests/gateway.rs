@@ -22,7 +22,6 @@ use tavily_mcp_gateway::{
     AppState, admin, app,
     auth::digest,
     catalog::canonical_tools,
-    config::WebSecurity,
     db::{Database, NewProvider, ProviderUpdate},
     gateway::ToolGateway,
     provider::ProviderManager,
@@ -118,10 +117,6 @@ async fn state() -> (AppState, tempfile::TempDir) {
         dir.path().join("gateway.db").display()
     );
     let db = Database::connect(&database_url).await.expect("database");
-    let web_security = WebSecurity {
-        production: false,
-        public_origin: None,
-    };
     let providers = Arc::new(
         ProviderManager::new(db.clone())
             .await
@@ -132,7 +127,6 @@ async fn state() -> (AppState, tempfile::TempDir) {
         db,
         providers,
         gateway: tool_gateway,
-        web_security,
     };
     admin::bootstrap(&state.db, "admin", Some("correct horse battery staple"))
         .await
@@ -357,7 +351,7 @@ async fn modern_discovery_is_stateless() {
 }
 
 #[tokio::test]
-async fn admin_csrf_write_only_tokens_and_login_throttle() {
+async fn admin_csrf_write_only_tokens() {
     let (state, _dir) = state().await;
     let gateway = app(state.clone());
     let login_body =
@@ -385,7 +379,7 @@ async fn admin_csrf_write_only_tokens_and_login_throttle() {
         .iter()
         .find_map(|value| value.strip_prefix("gateway_csrf="))
         .unwrap();
-    let create = json!({"kind":"searchix","name":"Searchix","endpoint":"https://example.test/mcp","token":"upstream-secret","weight":1,"enabled":false,"timeout_seconds":120}).to_string();
+    let create = json!({"kind":"searchix","name":"Searchix","endpoint":"https://example.test/mcp","token":"upstream-secret","weight":1,"enabled":false}).to_string();
     let no_csrf = gateway
         .clone()
         .oneshot(
@@ -426,33 +420,6 @@ async fn admin_csrf_write_only_tokens_and_login_throttle() {
     assert!(!encoded.contains("upstream-secret"));
     assert!(!encoded.contains("bearer_token"));
     assert_eq!(listed[0]["token_configured"], true);
-
-    for _ in 0..5 {
-        let _ = gateway
-            .clone()
-            .oneshot(
-                Request::post("/admin/api/login")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({"username":"blocked","password":"wrong"}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-    }
-    let blocked = gateway
-        .oneshot(
-            Request::post("/admin/api/login")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({"username":"blocked","password":"wrong"}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]
@@ -473,6 +440,11 @@ async fn provider_schema_has_no_probe_or_cooldown_state() {
         !provider_columns
             .iter()
             .any(|column| column == "base_cooldown_seconds")
+    );
+    assert!(
+        !provider_columns
+            .iter()
+            .any(|column| column == "timeout_seconds")
     );
     let probe_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='provider_probe_results'",
@@ -499,7 +471,7 @@ async fn settings_have_no_removed_maintenance_controls() {
     .await
     .unwrap();
     let removed_settings: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM settings WHERE key IN ('retention_days','default_cooldown_seconds')",
+        "SELECT COUNT(*) FROM settings WHERE key IN ('retention_days','default_cooldown_seconds','default_timeout_seconds')",
     )
     .fetch_one(&pool)
     .await
@@ -689,7 +661,6 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
             bearer_token: "test".into(),
             weight: 1,
             enabled: true,
-            timeout_seconds: 5,
         })
         .await
         .unwrap();
@@ -752,7 +723,6 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
                 bearer_token: None,
                 weight: 2,
                 enabled: true,
-                timeout_seconds: 1,
             },
         )
         .await;
@@ -786,7 +756,6 @@ async fn failed_provider_connections_do_not_poison_persistence_or_startup() {
         bearer_token: "test".into(),
         weight: 1,
         enabled: true,
-        timeout_seconds: 1,
     };
     assert!(state.providers.create(unreachable.clone()).await.is_err());
     assert!(state.db.provider_summaries().await.unwrap().is_empty());
@@ -864,8 +833,7 @@ async fn enabled_provider_creation_connects_before_activation() {
                         "endpoint":format!("http://{address}/mcp"),
                         "token":"test",
                         "weight":1,
-                        "enabled":true,
-                        "timeout_seconds":5
+                        "enabled":true
                     })
                     .to_string(),
                 ))

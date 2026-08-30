@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
         db,
         providers,
         gateway,
-        web_security: config.web_security(),
     };
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind=%config.bind,"gateway listening");

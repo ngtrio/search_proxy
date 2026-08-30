@@ -3,8 +3,6 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      GATEWAY_ENV: production
-      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
       DATABASE_URL: sqlite:///data/gateway.db?mode=rwc

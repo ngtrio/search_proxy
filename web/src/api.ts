@@ -1,4 +1,4 @@
-export type Provider = { id: number; kind: "searchix" | "tavily_hikari"; name: string; endpoint: string; weight: number; enabled: boolean; timeout_seconds: number; token_configured: boolean };
+export type Provider = { id: number; kind: "searchix" | "tavily_hikari"; name: string; endpoint: string; weight: number; enabled: boolean; token_configured: boolean };
 export type ClientKey = { id: number; name: string; prefix: string; status: string; created_at: string; last_used_at: string | null; request_count: number };
 export type RequestEvent = { request_id: string; client_key_prefix: string | null; client_key_name: string | null; provider: string | null; started_at: string; duration_ms: number; outcome: string; error_category: string | null };
 export type Metric = { requests: number; successes: number; failures: number; average_latency_ms: number };

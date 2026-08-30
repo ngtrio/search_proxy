@@ -3,9 +3,8 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use rmcp::service::RunningService;
@@ -31,8 +30,6 @@ use crate::{
 pub enum ProviderError {
     #[error("no connected provider currently supports {0}")]
     Unavailable(String),
-    #[error("provider timed out")]
-    Timeout,
     #[error("provider rate limited the request")]
     RateLimited,
     #[error("provider session expired")]
@@ -47,7 +44,6 @@ impl ProviderError {
     pub fn category(&self) -> &'static str {
         match self {
             Self::Unavailable(_) => "unavailable",
-            Self::Timeout => "timeout",
             Self::RateLimited => "rate_limited",
             Self::SessionExpired => "session_expired",
             Self::Transport => "transport",
@@ -99,7 +95,6 @@ struct ConnectedProvider {
     kind: String,
     endpoint: String,
     bearer_token: String,
-    timeout_seconds: AtomicU64,
     reconnect_required: AtomicBool,
     upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
@@ -136,7 +131,6 @@ impl ProviderManager {
             &provider.endpoint,
             &provider.bearer_token,
             provider.weight,
-            provider.timeout_seconds,
         )?;
         let prepared = if provider.enabled {
             Some(
@@ -144,7 +138,6 @@ impl ProviderManager {
                     &provider.kind,
                     &provider.endpoint,
                     &provider.bearer_token,
-                    provider.timeout_seconds,
                     canonical_tools(),
                 )
                 .await
@@ -197,7 +190,6 @@ impl ProviderManager {
                 .to_owned(),
             weight: update.weight,
             enabled: update.enabled,
-            timeout_seconds: update.timeout_seconds,
         };
         validate_provider(
             &desired.kind,
@@ -205,7 +197,6 @@ impl ProviderManager {
             &desired.endpoint,
             &desired.bearer_token,
             desired.weight,
-            desired.timeout_seconds,
         )?;
         let live = self.find(id);
         let can_reuse = live.as_ref().is_some_and(|provider| {
@@ -243,9 +234,6 @@ impl ProviderManager {
         } else if let Some((client, upstream_tools)) = prepared {
             self.install(ConnectedProvider::new(desired, client, upstream_tools));
         } else if let Some(provider) = live {
-            provider
-                .timeout_seconds
-                .store(desired.timeout_seconds as u64, Ordering::Relaxed);
             self.router
                 .write()
                 .expect("provider router poisoned")
@@ -315,16 +303,10 @@ impl ProviderManager {
             .expect("selected provider supports requested tool")
             .clone();
         let params = CallToolRequestParams::new(upstream_name).with_arguments(arguments);
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(provider.timeout_seconds.load(Ordering::Relaxed)),
-            provider.client.call_tool_once(params),
-        )
-        .await;
-        match outcome {
-            Err(_) => Err(ProviderFailure::after_routing(id, ProviderError::Timeout)),
-            Ok(Ok(CallToolResponse::Complete(result))) => Ok((id, result)),
-            Ok(Ok(_)) => Err(ProviderFailure::after_routing(id, ProviderError::Upstream)),
-            Ok(Err(error)) => {
+        match provider.client.call_tool_once(params).await {
+            Ok(CallToolResponse::Complete(result)) => Ok((id, result)),
+            Ok(_) => Err(ProviderFailure::after_routing(id, ProviderError::Upstream)),
+            Err(error) => {
                 let text = error.to_string().to_ascii_lowercase();
                 let returned = if text.contains("session expired") {
                     ProviderError::SessionExpired
@@ -403,7 +385,6 @@ fn validate_provider(
     endpoint: &str,
     bearer_token: &str,
     weight: i64,
-    timeout_seconds: i64,
 ) -> Result<(), ProviderMutationError> {
     if !["searchix", "tavily_hikari"].contains(&kind) {
         return Err(ProviderMutationError::Invalid("unsupported provider kind"));
@@ -428,9 +409,6 @@ fn validate_provider(
     if weight <= 0 {
         return Err(ProviderMutationError::Invalid("weight must be positive"));
     }
-    if timeout_seconds <= 0 {
-        return Err(ProviderMutationError::Invalid("timeout must be positive"));
-    }
     Ok(())
 }
 
@@ -446,7 +424,6 @@ impl ConnectedProvider {
             kind: provider.kind,
             endpoint: provider.endpoint,
             bearer_token: provider.bearer_token,
-            timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
             reconnect_required: AtomicBool::new(false),
             upstream_tools,
             client,
@@ -465,7 +442,6 @@ impl ConnectedProvider {
             kind: provider.kind,
             endpoint: provider.endpoint,
             bearer_token: provider.bearer_token,
-            timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
             reconnect_required: AtomicBool::new(false),
             upstream_tools,
             client,
@@ -490,7 +466,6 @@ async fn connect_config(
         &provider.kind,
         &provider.endpoint,
         &provider.bearer_token,
-        provider.timeout_seconds,
         canonical_tools,
     )
     .await
@@ -500,7 +475,6 @@ async fn connect(
     kind: &str,
     endpoint: &str,
     bearer_token: &str,
-    timeout_seconds: i64,
     canonical_tools: &[rmcp::model::Tool],
 ) -> anyhow::Result<(
     RunningService<RoleClient, ClientInfo>,
@@ -512,18 +486,15 @@ async fn connect(
             // An in-flight tool call must never be replayed after session recovery.
             .reinit_on_expired_session(false),
     );
-    let mut client = tokio::time::timeout(
-        Duration::from_secs(timeout_seconds as u64),
-        ClientInfo::default().serve_with_lifecycle(
+    let mut client = ClientInfo::default()
+        .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Auto {
                 preferred_versions: vec![ProtocolVersion::V_2026_07_28],
                 legacy_version: Some(ProtocolVersion::V_2025_11_25),
             },
-        ),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("initialize timed out"))??;
+        )
+        .await?;
     let catalog = async {
         let mut cursor = None;
         let mut upstream_names = HashSet::new();
@@ -531,12 +502,7 @@ async fn connect(
             let params = cursor
                 .clone()
                 .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
-            let page = tokio::time::timeout(
-                Duration::from_secs(timeout_seconds as u64),
-                client.list_tools(params),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("tools/list timed out"))??;
+            let page = client.list_tools(params).await?;
             for tool in page.tools {
                 upstream_names.insert(tool.name.into_owned());
             }

@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::{
     AppState,
     auth::{digest, hash_password, random_secret, verify_digest, verify_password},
-    db::{GatewaySettings, NewProvider, ProviderUpdate},
+    db::{NewProvider, ProviderUpdate},
     provider::ProviderMutationError,
 };
 
@@ -28,19 +28,6 @@ pub fn routes() -> Router<AppState> {
         .route("/providers/{id}", put(update_provider))
         .route("/overview", get(overview))
         .route("/requests", get(requests))
-        .route("/settings", get(settings).put(update_settings))
-}
-
-pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let readiness = state.gateway.readiness().await;
-    (
-        if readiness.ready {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        },
-        Json(json!({"ready":readiness.ready,"database":readiness.database})),
-    )
 }
 
 #[derive(RustEmbed)]
@@ -75,38 +62,12 @@ struct Login {
     username: String,
     password: String,
 }
-const ADMIN_LOGIN_THROTTLE_ID: &str = "administrator";
 
-async fn login(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<Login>,
-) -> impl IntoResponse {
-    if !same_origin(&state, &headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> impl IntoResponse {
     if input.username.len() > 128 || input.password.len() > 1024 {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid credentials"})),
-        )
-            .into_response();
-    }
-    let locked = match state
-        .db
-        .admin_login_is_locked(ADMIN_LOGIN_THROTTLE_ID)
-        .await
-    {
-        Ok(locked) => locked,
-        Err(error) => {
-            tracing::error!(%error, "could not read admin login throttle");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    if locked {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error":"authentication temporarily unavailable"})),
         )
             .into_response();
     }
@@ -138,25 +99,11 @@ async fn login(
         None => false,
     };
     if !authenticated {
-        if let Err(error) = state
-            .db
-            .record_admin_login_failure(ADMIN_LOGIN_THROTTLE_ID)
-            .await
-        {
-            tracing::warn!(%error, "could not record admin login failure");
-        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid credentials"})),
         )
             .into_response();
-    }
-    if let Err(error) = state
-        .db
-        .clear_admin_login_failures(ADMIN_LOGIN_THROTTLE_ID)
-        .await
-    {
-        tracing::warn!(%error, "could not clear admin login throttle");
     }
     let token = random_secret(32);
     let csrf = random_secret(32);
@@ -172,16 +119,9 @@ async fn login(
         tracing::error!(%error, "could not create admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let secure = if state.web_security.production {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "gateway_session={token}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=28800{secure}"
-    );
-    let csrf_cookie =
-        format!("gateway_csrf={csrf}; Path=/admin; SameSite=Strict; Max-Age=28800{secure}");
+    let cookie =
+        format!("gateway_session={token}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=28800");
+    let csrf_cookie = format!("gateway_csrf={csrf}; Path=/admin; SameSite=Strict; Max-Age=28800");
     let mut response = (
         StatusCode::OK,
         Json(json!({"csrf_token":csrf,"expires_at":expires})),
@@ -223,9 +163,6 @@ async fn logout(AdminWrite(id): AdminWrite, State(state): State<AppState>) -> im
 }
 
 async fn admin_auth(state: &AppState, headers: &HeaderMap, write: bool) -> Option<String> {
-    if write && !same_origin(state, headers) {
-        return None;
-    }
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     let token = cookies
         .split(';')
@@ -277,13 +214,6 @@ impl FromRequestParts<AppState> for AdminWrite {
             .map(Self)
             .ok_or(StatusCode::UNAUTHORIZED)
     }
-}
-
-fn same_origin(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = &state.web_security.public_origin else {
-        return !state.web_security.production;
-    };
-    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(expected.as_str())
 }
 
 async fn keys(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
@@ -356,7 +286,6 @@ struct ProviderInput {
     token: Option<String>,
     weight: i64,
     enabled: bool,
-    timeout_seconds: i64,
 }
 async fn create_provider(
     _auth: AdminWrite,
@@ -375,7 +304,6 @@ async fn create_provider(
             bearer_token: token,
             weight: input.weight,
             enabled: input.enabled,
-            timeout_seconds: input.timeout_seconds,
         })
         .await
     {
@@ -412,7 +340,6 @@ async fn update_provider(
                 bearer_token: input.token,
                 weight: input.weight,
                 enabled: input.enabled,
-                timeout_seconds: input.timeout_seconds,
             },
         )
         .await
@@ -451,42 +378,6 @@ async fn requests(_auth: AdminRead, State(state): State<AppState>) -> impl IntoR
         Err(error) => {
             tracing::error!(%error, "could not load recent requests");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-async fn settings(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
-    match state.db.settings().await {
-        Ok(settings) => Json(settings).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "could not load gateway settings");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct SettingsInput {
-    default_timeout_seconds: i64,
-}
-async fn update_settings(
-    _auth: AdminWrite,
-    State(state): State<AppState>,
-    Json(input): Json<SettingsInput>,
-) -> impl IntoResponse {
-    if input.default_timeout_seconds <= 0 {
-        return StatusCode::BAD_REQUEST;
-    }
-    match state
-        .db
-        .update_settings(&GatewaySettings {
-            default_timeout_seconds: input.default_timeout_seconds,
-        })
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(error) => {
-            tracing::error!(%error, "could not update gateway settings");
-            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }

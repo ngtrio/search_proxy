@@ -4,11 +4,11 @@ The gateway is a single-process service. Its SQLite database contains plaintext 
 
 ## Deploy
 
-Copy `.env.example` to `.env`, set a long administrator password and the exact public HTTPS origin, then run `docker compose up -d --build`. Put the service behind TLS. Restrict the Docker host, `/var/lib/docker/volumes`, and backup directory to administrators.
+Copy `.env.example` to `.env`, set a long administrator password, then run `docker compose up -d --build`. Put the service behind TLS. Restrict the Docker host, `/var/lib/docker/volumes`, and backup directory to administrators.
 
-Readiness (`/health/ready`) requires a migrated database and one connected provider. Liveness (`/health/live`) only confirms that the process responds.
+Liveness (`/health/live`) only confirms that the process responds.
 
-An unavailable provider is logged and skipped during startup so the administration plane remains available for recovery. The gateway becomes ready when at least one enabled provider connects successfully.
+An unavailable provider is logged and skipped during startup so the administration plane remains available for recovery.
 
 ## Reverse proxy
 
@@ -50,10 +50,10 @@ sqlite3 /data/backup-2026-08-27.db 'PRAGMA integrity_check;'
 
 Copy the backup to access-controlled encrypted storage. A backup contains plaintext provider tokens.
 
-To exercise restore, stop the gateway, preserve the current database files, copy a verified backup to a new `gateway.db`, set ownership/permissions, and start the gateway. Confirm migrations, login, key metadata, provider records, and readiness. Do not restore over a running WAL database.
+To exercise restore, stop the gateway, preserve the current database files, copy a verified backup to a new `gateway.db`, set ownership/permissions, and start the gateway. Confirm migrations, login, key metadata, provider records, and liveness. Do not restore over a running WAL database.
 
 ## Rollback
 
-Before an upgrade, take and verify an online backup. Keep the previous immutable image. If rollback is needed, stop the new container, restore the pre-upgrade database when migrations are not backward-compatible, select the prior image, and start it. Confirm readiness before returning traffic.
+Before an upgrade, take and verify an online backup. Keep the previous immutable image. If rollback is needed, stop the new container, restore the pre-upgrade database when migrations are not backward-compatible, select the prior image, and start it. Confirm liveness before returning traffic.
 
 Structured logs include request identifiers, provider/client metadata IDs, durations, and outcome categories only. They must never include search queries, arguments, results, passwords, client keys, or provider tokens.

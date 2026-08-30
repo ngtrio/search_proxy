@@ -20,13 +20,11 @@ pub struct AppState {
     pub db: Database,
     pub providers: Arc<ProviderManager>,
     pub gateway: Arc<ToolGateway>,
-    pub web_security: config::WebSecurity,
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
-        .route("/health/ready", get(admin::ready))
         .nest("/mcp", mcp::routes(state.clone()))
         .nest("/admin/api", admin::routes())
         .route("/admin", get(admin::spa))

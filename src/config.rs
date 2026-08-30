@@ -5,14 +5,6 @@ pub struct Config {
     pub database_url: String,
     pub admin_username: String,
     pub admin_password: Option<String>,
-    pub production: bool,
-    pub public_origin: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct WebSecurity {
-    pub production: bool,
-    pub public_origin: Option<String>,
 }
 
 impl Config {
@@ -25,8 +17,6 @@ impl Config {
                 .unwrap_or_else(|_| "sqlite://data/gateway.db?mode=rwc".into()),
             admin_username: env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".into()),
             admin_password: env::var("ADMIN_PASSWORD").ok(),
-            production: env::var("GATEWAY_ENV").is_ok_and(|v| v == "production"),
-            public_origin: env::var("PUBLIC_ORIGIN").ok(),
         })
     }
 
@@ -37,12 +27,5 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         Ok(())
-    }
-
-    pub fn web_security(&self) -> WebSecurity {
-        WebSecurity {
-            production: self.production,
-            public_origin: self.public_origin.clone(),
-        }
     }
 }

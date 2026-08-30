@@ -12,7 +12,6 @@ pub struct ProviderConfig {
     pub bearer_token: String,
     pub weight: i64,
     pub enabled: bool,
-    pub timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -23,7 +22,6 @@ pub struct ProviderSummary {
     pub endpoint: String,
     pub weight: i64,
     pub enabled: bool,
-    pub timeout_seconds: i64,
     pub token_configured: bool,
 }
 
@@ -35,7 +33,6 @@ pub struct NewProvider {
     pub bearer_token: String,
     pub weight: i64,
     pub enabled: bool,
-    pub timeout_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,13 +43,12 @@ pub struct ProviderUpdate {
     pub bearer_token: Option<String>,
     pub weight: i64,
     pub enabled: bool,
-    pub timeout_seconds: i64,
 }
 
 impl Database {
     pub async fn providers(&self) -> Result<Vec<ProviderConfig>, sqlx::Error> {
         sqlx::query_as::<_, ProviderConfig>(
-            "SELECT id, kind, name, endpoint, bearer_token, weight, enabled, timeout_seconds
+            "SELECT id, kind, name, endpoint, bearer_token, weight, enabled
              FROM providers
              ORDER BY id",
         )
@@ -62,7 +58,7 @@ impl Database {
 
     pub async fn provider(&self, id: i64) -> Result<Option<ProviderConfig>, sqlx::Error> {
         sqlx::query_as::<_, ProviderConfig>(
-            "SELECT id, kind, name, endpoint, bearer_token, weight, enabled, timeout_seconds
+            "SELECT id, kind, name, endpoint, bearer_token, weight, enabled
              FROM providers
              WHERE id = ?",
         )
@@ -73,7 +69,7 @@ impl Database {
 
     pub async fn provider_summaries(&self) -> Result<Vec<ProviderSummary>, sqlx::Error> {
         sqlx::query_as::<_, ProviderSummary>(
-            "SELECT id, kind, name, endpoint, weight, enabled, timeout_seconds,
+            "SELECT id, kind, name, endpoint, weight, enabled,
                     (bearer_token <> '') AS token_configured
              FROM providers
              ORDER BY id",
@@ -85,8 +81,8 @@ impl Database {
     pub async fn create_provider(&self, provider: NewProvider) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO providers
-                (kind, name, endpoint, bearer_token, weight, enabled, timeout_seconds)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (kind, name, endpoint, bearer_token, weight, enabled)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(provider.kind)
         .bind(provider.name)
@@ -94,7 +90,6 @@ impl Database {
         .bind(provider.bearer_token)
         .bind(provider.weight)
         .bind(provider.enabled)
-        .bind(provider.timeout_seconds)
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
@@ -113,7 +108,6 @@ impl Database {
                  bearer_token = COALESCE(NULLIF(?, ''), bearer_token),
                  weight = ?,
                  enabled = ?,
-                 timeout_seconds = ?,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?",
         )
@@ -123,7 +117,6 @@ impl Database {
         .bind(provider.bearer_token)
         .bind(provider.weight)
         .bind(provider.enabled)
-        .bind(provider.timeout_seconds)
         .bind(id)
         .execute(&self.pool)
         .await?;

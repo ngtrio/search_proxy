@@ -12,12 +12,6 @@ pub enum ToolGatewayError {
     UnknownTool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Readiness {
-    pub ready: bool,
-    pub database: bool,
-}
-
 pub struct ToolGateway {
     db: Database,
     providers: Arc<ProviderManager>,
@@ -30,14 +24,6 @@ impl ToolGateway {
 
     pub fn tools(&self) -> &[Tool] {
         canonical_tools()
-    }
-
-    pub async fn readiness(&self) -> Readiness {
-        let database = self.db.health_check().await.is_ok();
-        Readiness {
-            ready: database && self.providers.has_providers(),
-            database,
-        }
     }
 
     pub async fn call(

@@ -1,13 +1,11 @@
 mod admin;
 mod client_keys;
 mod providers;
-mod settings;
 mod usage;
 
 pub use admin::{AdminCredentials, AdminSession};
 pub use client_keys::ClientKeySummary;
 pub use providers::{NewProvider, ProviderConfig, ProviderSummary, ProviderUpdate};
-pub use settings::GatewaySettings;
 pub use usage::{DailyMetric, ProviderMetric, RequestRecord, RequestSummary, UsageOverview};
 
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -39,12 +37,5 @@ impl Database {
             .await?;
         sqlx::migrate!().run(&pool).await?;
         Ok(Self { pool })
-    }
-
-    pub async fn health_check(&self) -> Result<(), sqlx::Error> {
-        sqlx::query_scalar::<_, i64>("SELECT 1")
-            .fetch_one(&self.pool)
-            .await
-            .map(|_| ())
     }
 }
