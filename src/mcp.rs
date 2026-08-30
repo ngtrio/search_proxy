@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, time::Instant};
 
 use axum::{
     Router,
@@ -12,7 +12,7 @@ use rmcp::{
     ErrorData, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -21,7 +21,11 @@ use rmcp::{
 };
 use uuid::Uuid;
 
-use crate::{AppState, auth::verify_digest, provider::canonical_schema};
+use crate::{
+    AppState,
+    auth::verify_digest,
+    catalog::{canonical_tool, canonical_tools},
+};
 
 #[derive(Clone)]
 struct GatewayHandler {
@@ -31,7 +35,7 @@ struct GatewayHandler {
 impl ServerHandler for GatewayHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("A canonical Tavily web-search gateway")
+            .with_instructions("A canonical gateway for the official Tavily MCP tool catalog")
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -48,7 +52,9 @@ impl ServerHandler for GatewayHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
-        std::future::ready(Ok(ListToolsResult::with_all_items(vec![canonical_tool()])))
+        std::future::ready(Ok(ListToolsResult::with_all_items(
+            canonical_tools().to_vec(),
+        )))
     }
 
     async fn call_tool(
@@ -56,7 +62,7 @@ impl ServerHandler for GatewayHandler {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        if request.name != "tavily_search" {
+        if canonical_tool(request.name.as_ref()).is_none() {
             return Err(ErrorData::invalid_params("unknown tool", None));
         }
         let client_key_id = context
@@ -73,7 +79,12 @@ impl ServerHandler for GatewayHandler {
             .bind(client_key_id)
             .execute(&self.state.db.0)
             .await;
-        match self.state.providers.call(arguments).await {
+        match self
+            .state
+            .providers
+            .call(request.name.as_ref(), arguments)
+            .await
+        {
             Ok((provider_id, result)) => {
                 let provider_error = result.is_error.unwrap_or(false);
                 record(
@@ -103,14 +114,6 @@ impl ServerHandler for GatewayHandler {
             }
         }
     }
-}
-
-fn canonical_tool() -> Tool {
-    Tool::new(
-        "tavily_search",
-        "Search the web with Tavily through a connected provider.",
-        Arc::new(canonical_schema()),
-    )
 }
 
 pub fn routes(state: AppState) -> Router<AppState> {
@@ -231,12 +234,19 @@ async fn record(
 mod tests {
     use super::*;
     #[test]
-    fn exposes_only_the_canonical_tool() {
-        let tool = canonical_tool();
-        assert_eq!(tool.name, "tavily_search");
+    fn exposes_the_pinned_official_catalog() {
+        assert_eq!(canonical_tools().len(), 5);
+        let tool = canonical_tool("tavily_search").unwrap();
         assert_eq!(
             tool.input_schema.get("required"),
             Some(&serde_json::json!(["query"]))
+        );
+        assert_eq!(
+            canonical_tool("tavily_research")
+                .unwrap()
+                .input_schema
+                .get("required"),
+            Some(&serde_json::json!(["input"]))
         );
     }
     #[test]

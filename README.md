@@ -1,6 +1,14 @@
 # Tavily MCP Gateway
 
-A single-process Rust gateway exposing one authenticated `/mcp` endpoint and a stable `tavily_search` tool across Searchix and Tavily Hikari providers.
+A single-process Rust gateway exposing one authenticated `/mcp` endpoint and the official Tavily MCP tool catalog across Searchix and Tavily Hikari providers:
+
+- `tavily_search`
+- `tavily_extract`
+- `tavily_crawl`
+- `tavily_map`
+- `tavily_research`
+
+The public catalog is pinned to Tavily MCP `0.2.22` at commit `248dc9e3e385305ad3281120284ff662af4b5940`; the vendored reference is [`schemas/tavily-mcp-0.2.22.json`](schemas/tavily-mcp-0.2.22.json).
 
 ## Development
 
@@ -14,4 +22,4 @@ pnpm --dir web build
 
 Set `DATABASE_URL`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD`. Provider credentials are configured through the administration panel and are intentionally stored in plaintext SQLite fields; see [operations](docs/operations.md).
 
-All enabled providers are connected before the gateway starts accepting traffic. Activation performs an authenticated initialize and a fully paginated `tools/list` lookup for the mapped search tool. Tool schemas and arguments are passed through without compatibility validation. Failed calls are never replayed to another provider.
+All enabled providers are connected before the gateway starts accepting traffic. Activation performs an authenticated initialize and a fully paginated `tools/list`, records the canonical Tavily tools that provider exposes, and requires at least one mapped tool. Calls are routed only to providers that advertised the requested tool. Tavily Hikari uses the canonical names; Searchix discovery recognizes both canonical names and its `search_proxy_` naming convention. Arguments and results are passed through without transformation, and failed calls are never replayed to another provider.

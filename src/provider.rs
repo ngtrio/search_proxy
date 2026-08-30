@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -18,35 +20,18 @@ use rmcp::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::{
+    catalog::canonical_tools,
     db::{Database, ProviderRow},
     router::WeightedRandom,
 };
 
-const CANONICAL_FIELDS: &[&str] = &[
-    "query",
-    "country",
-    "end_date",
-    "exact_match",
-    "exclude_domains",
-    "include_domains",
-    "include_favicon",
-    "include_image_descriptions",
-    "include_images",
-    "include_raw_content",
-    "max_results",
-    "search_depth",
-    "start_date",
-    "time_range",
-    "topic",
-];
-
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("no connected provider is currently available")]
-    Unavailable,
+    #[error("no connected provider currently supports {0}")]
+    Unavailable(String),
     #[error("provider timed out")]
     Timeout,
     #[error("provider rate limited the request")]
@@ -62,7 +47,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn category(&self) -> &'static str {
         match self {
-            Self::Unavailable => "unavailable",
+            Self::Unavailable(_) => "unavailable",
             Self::Timeout => "timeout",
             Self::RateLimited(_) => "rate_limited",
             Self::SessionExpired => "session_expired",
@@ -105,6 +90,7 @@ struct ConnectedProvider {
     endpoint: String,
     bearer_token: String,
     timeout_seconds: AtomicU64,
+    upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
 }
 
@@ -114,35 +100,17 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     pub async fn new(db: Database) -> anyhow::Result<Self> {
-        let providers = db
-            .providers()
-            .await?
-            .into_iter()
-            .filter(|provider| provider.enabled)
-            .collect::<Vec<_>>();
-        let mut connected = Vec::with_capacity(providers.len());
-        for provider in providers {
-            match connect(&provider).await {
-                Ok(client) => {
-                    let weight = provider.weight;
-                    connected.push((connected_provider(provider, client), weight));
-                }
-                Err(error) => {
-                    drop(connected);
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to connect provider {} ({})",
-                            provider.name, provider.id
-                        )
-                    });
-                }
-            }
+        let registry = Self {
+            router: RwLock::new(WeightedRandom::default()),
+        };
+        for provider in db.providers().await? {
+            let description = format!("{} ({})", provider.name, provider.id);
+            registry
+                .add(provider)
+                .await
+                .with_context(|| format!("failed to connect provider {description}"))?;
         }
-        let mut router = WeightedRandom::default();
-        router.replace(connected);
-        Ok(Self {
-            router: RwLock::new(router),
-        })
+        Ok(registry)
     }
 
     /// Adds one provider to the live router without touching existing connections.
@@ -161,8 +129,8 @@ impl ProviderRegistry {
         }
         let id = provider.id;
         let weight = provider.weight;
-        let client = connect(&provider).await?;
-        let connected = connected_provider(provider, client);
+        let (client, upstream_tools) = connect(&provider).await?;
+        let connected = Arc::new(ConnectedProvider::new(provider, client, upstream_tools));
         let mut router = self.router.write().expect("provider router poisoned");
         if router.find(|current| current.id == id).is_some() {
             anyhow::bail!("provider {id} is already active");
@@ -199,8 +167,8 @@ impl ProviderRegistry {
                 Arc::clone(current)
             }
             _ => {
-                let client = connect(&provider).await?;
-                connected_provider(provider, client)
+                let (client, upstream_tools) = connect(&provider).await?;
+                Arc::new(ConnectedProvider::new(provider, client, upstream_tools))
             }
         };
         self.router
@@ -228,18 +196,25 @@ impl ProviderRegistry {
 
     pub async fn call(
         &self,
+        tool_name: &str,
         arguments: Map<String, Value>,
     ) -> Result<(i64, CallToolResult), ProviderFailure> {
         let provider = self
             .router
             .read()
             .expect("provider router poisoned")
-            .next_provider()
+            .next_provider_matching(|provider| provider.upstream_tools.contains_key(tool_name))
             .cloned()
-            .ok_or_else(|| ProviderFailure::before_routing(ProviderError::Unavailable))?;
+            .ok_or_else(|| {
+                ProviderFailure::before_routing(ProviderError::Unavailable(tool_name.to_owned()))
+            })?;
         let id = provider.id;
-        let params =
-            CallToolRequestParams::new(mapped_name(&provider.kind)).with_arguments(arguments);
+        let upstream_name = provider
+            .upstream_tools
+            .get(tool_name)
+            .expect("selected provider supports requested tool")
+            .clone();
+        let params = CallToolRequestParams::new(upstream_name).with_arguments(arguments);
         let outcome = tokio::time::timeout(
             Duration::from_secs(provider.timeout_seconds.load(Ordering::Relaxed)),
             provider.client.call_tool_once(params),
@@ -265,6 +240,22 @@ impl ProviderRegistry {
 }
 
 impl ConnectedProvider {
+    fn new(
+        provider: ProviderRow,
+        client: RunningService<RoleClient, ClientInfo>,
+        upstream_tools: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: provider.id,
+            kind: provider.kind,
+            endpoint: provider.endpoint,
+            bearer_token: provider.bearer_token,
+            timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
+            upstream_tools,
+            client,
+        }
+    }
+
     fn has_same_connection(&self, provider: &ProviderRow) -> bool {
         self.kind == provider.kind
             && self.endpoint == provider.endpoint
@@ -272,21 +263,12 @@ impl ConnectedProvider {
     }
 }
 
-fn connected_provider(
-    provider: ProviderRow,
-    client: RunningService<RoleClient, ClientInfo>,
-) -> Arc<ConnectedProvider> {
-    Arc::new(ConnectedProvider {
-        id: provider.id,
-        kind: provider.kind,
-        endpoint: provider.endpoint,
-        bearer_token: provider.bearer_token,
-        timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
-        client,
-    })
-}
-
-async fn connect(provider: &ProviderRow) -> anyhow::Result<RunningService<RoleClient, ClientInfo>> {
+async fn connect(
+    provider: &ProviderRow,
+) -> anyhow::Result<(
+    RunningService<RoleClient, ClientInfo>,
+    HashMap<String, String>,
+)> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(provider.endpoint.clone())
             .auth_header(provider.bearer_token.clone())
@@ -307,6 +289,7 @@ async fn connect(provider: &ProviderRow) -> anyhow::Result<RunningService<RoleCl
     .map_err(|_| anyhow::anyhow!("initialize timed out"))??;
     let catalog = async {
         let mut cursor = None;
+        let mut upstream_names = HashSet::new();
         loop {
             let params = cursor
                 .clone()
@@ -317,59 +300,64 @@ async fn connect(provider: &ProviderRow) -> anyhow::Result<RunningService<RoleCl
             )
             .await
             .map_err(|_| anyhow::anyhow!("tools/list timed out"))??;
-            if page
-                .tools
-                .iter()
-                .any(|tool| tool.name == mapped_name(&provider.kind))
-            {
-                return Ok(());
+            for tool in page.tools {
+                upstream_names.insert(tool.name.into_owned());
             }
             cursor = page.next_cursor;
             if cursor.is_none() {
-                anyhow::bail!("mapped search tool is absent");
+                break;
             }
         }
+
+        let mapped = canonical_tools()
+            .iter()
+            .filter_map(|tool| {
+                mapped_name_candidates(&provider.kind, tool.name.as_ref())
+                    .into_iter()
+                    .find(|upstream_name| upstream_names.contains(upstream_name.as_ref()))
+                    .map(|upstream_name| (tool.name.to_string(), upstream_name.into_owned()))
+            })
+            .collect::<HashMap<_, _>>();
+        if mapped.is_empty() {
+            anyhow::bail!("mapped Tavily tools are absent");
+        }
+        Ok(mapped)
     }
     .await;
-    if let Err(error) = catalog {
-        let _ = client.close().await;
-        return Err(error);
+    match catalog {
+        Ok(mapped) => Ok((client, mapped)),
+        Err(error) => {
+            let _ = client.close().await;
+            Err(error)
+        }
     }
-    Ok(client)
 }
 
-pub fn mapped_name(kind: &str) -> &'static str {
+pub fn mapped_name_candidates<'a>(kind: &str, canonical_name: &'a str) -> Vec<Cow<'a, str>> {
     if kind == "searchix" {
-        "search_proxy_tavily_search"
+        vec![
+            Cow::Owned(format!("search_proxy_{canonical_name}")),
+            Cow::Borrowed(canonical_name),
+        ]
     } else {
-        "tavily_search"
+        vec![Cow::Borrowed(canonical_name)]
     }
-}
-
-pub fn canonical_schema() -> Map<String, Value> {
-    let mut properties = Map::new();
-    properties.insert("query".into(), json!({"type":"string"}));
-    for field in CANONICAL_FIELDS.iter().skip(1) {
-        let schema = if ["exclude_domains", "include_domains"].contains(field) {
-            json!({"type":"array","items":{"type":"string"}})
-        } else if *field == "max_results" {
-            json!({"type":"integer","minimum":1,"maximum":20})
-        } else if field.starts_with("include_") || *field == "exact_match" {
-            json!({"type":"boolean"})
-        } else {
-            json!({"type":"string"})
-        };
-        properties.insert((*field).into(), schema);
-    }
-    json!({"type":"object","properties":properties,"required":["query"],"additionalProperties":false}).as_object().expect("schema object").clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn provider_names_are_internal() {
-        assert_eq!(mapped_name("searchix"), "search_proxy_tavily_search");
-        assert_eq!(mapped_name("tavily_hikari"), "tavily_search");
+    fn provider_name_candidates_cover_every_canonical_tool() {
+        for tool in canonical_tools() {
+            assert_eq!(
+                mapped_name_candidates("searchix", tool.name.as_ref()),
+                [format!("search_proxy_{}", tool.name), tool.name.to_string()]
+            );
+            assert_eq!(
+                mapped_name_candidates("tavily_hikari", tool.name.as_ref()),
+                [tool.name.to_string()]
+            );
+        }
     }
 }

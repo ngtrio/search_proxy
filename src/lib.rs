@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod mcp;

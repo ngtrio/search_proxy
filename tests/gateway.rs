@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -18,7 +18,8 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use tavily_mcp_gateway::{
-    AppState, admin, app, auth::digest, config::Config, db::Database, provider::ProviderRegistry,
+    AppState, admin, app, auth::digest, catalog::canonical_tools, config::Config, db::Database,
+    provider::ProviderRegistry,
 };
 use tower::ServiceExt;
 
@@ -26,6 +27,8 @@ use tower::ServiceExt;
 struct MockSearchix {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     fail: Arc<std::sync::atomic::AtomicBool>,
+    advertise_all_tools: Arc<std::sync::atomic::AtomicBool>,
+    last_tool: Arc<Mutex<Option<String>>>,
 }
 
 impl ServerHandler for MockSearchix {
@@ -56,11 +59,23 @@ impl ServerHandler for MockSearchix {
             .as_object()
             .unwrap()
             .clone();
-            ListToolsResult::with_all_items(vec![Tool::new(
-                "search_proxy_tavily_search",
-                "search",
-                Arc::new(input_schema),
-            )])
+            ListToolsResult::with_all_items(
+                canonical_tools()
+                    .iter()
+                    .filter(|tool| {
+                        self.advertise_all_tools
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            || tool.name == "tavily_search"
+                    })
+                    .map(|tool| {
+                        Tool::new(
+                            format!("search_proxy_{}", tool.name),
+                            "mock Tavily tool",
+                            Arc::new(input_schema.clone()),
+                        )
+                    })
+                    .collect(),
+            )
         }))
     }
     async fn call_tool(
@@ -68,7 +83,12 @@ impl ServerHandler for MockSearchix {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        assert_eq!(request.name, "search_proxy_tavily_search");
+        assert!(
+            request.name.starts_with("search_proxy_tavily_"),
+            "unexpected mapped tool: {}",
+            request.name
+        );
+        *self.last_tool.lock().unwrap() = Some(request.name.to_string());
         assert!(
             request
                 .arguments
@@ -122,6 +142,22 @@ async fn body_json(response: axum::response::Response) -> Value {
         .expect("body")
         .to_bytes();
     serde_json::from_slice(&bytes).expect("json")
+}
+
+async fn body_sse_json(response: axum::response::Response) -> Value {
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body = String::from_utf8(bytes.to_vec()).expect("utf-8 SSE body");
+    let data = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .find(|data| !data.is_empty())
+        .expect("SSE data frame");
+    serde_json::from_str(data).expect("SSE JSON data")
 }
 
 #[tokio::test]
@@ -181,6 +217,111 @@ async fn mcp_requires_auth_and_negotiates_all_legacy_revisions() {
         .unwrap();
         assert!(body.contains(version));
     }
+}
+
+#[tokio::test]
+async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
+    let (state, _dir) = state().await;
+    let secret = "tmg_catalog";
+    sqlx::query(
+        "INSERT INTO client_api_keys(name,prefix,digest) VALUES('catalog','tmg_catalog',?)",
+    )
+    .bind(digest(secret))
+    .execute(&state.db.0)
+    .await
+    .unwrap();
+    let gateway = app(state);
+    let authorization = format!("Bearer {secret}");
+    let initialized = gateway
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, &authorization)
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session = initialized
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let request = |body: Value| {
+        Request::post("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, &authorization)
+            .header("Mcp-Session-Id", &session)
+            .header("Mcp-Protocol-Version", "2025-11-25")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let _ = gateway
+        .clone()
+        .oneshot(request(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })))
+        .await
+        .unwrap();
+
+    let listed = gateway
+        .clone()
+        .oneshot(request(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })))
+        .await
+        .unwrap();
+    let listed = body_sse_json(listed).await;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "tavily_search",
+            "tavily_extract",
+            "tavily_crawl",
+            "tavily_map",
+            "tavily_research",
+        ]
+    );
+    assert_eq!(
+        listed["result"]["tools"][4]["inputSchema"]["required"],
+        json!(["input"])
+    );
+
+    let called = gateway
+        .oneshot(request(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "tavily_research", "arguments": {"input": "test"}}
+        })))
+        .await
+        .unwrap();
+    let called = body_sse_json(called).await;
+    assert!(
+        called["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no connected provider")
+    );
 }
 
 #[tokio::test]
@@ -495,8 +636,10 @@ async fn tool_calls_write_metadata_and_daily_aggregates_only() {
 }
 
 #[tokio::test]
-async fn provider_startup_connect_paginates_maps_and_calls_once() {
+async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     let mock = MockSearchix::default();
+    mock.advertise_all_tools
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let service: StreamableHttpService<MockSearchix, LocalSessionManager> =
         StreamableHttpService::new(
             {
@@ -518,17 +661,41 @@ async fn provider_startup_connect_paginates_maps_and_calls_once() {
     let provider_id=sqlx::query("INSERT INTO providers(kind,name,endpoint,bearer_token,weight,enabled,timeout_seconds) VALUES('searchix','mock',?,'test',1,1,5)").bind(endpoint).execute(&state.db.0).await.unwrap().last_insert_rowid();
     let provider = state.db.provider(provider_id).await.unwrap().unwrap();
     state.providers.add(provider).await.unwrap();
-    let mut arguments = serde_json::Map::new();
-    arguments.insert("provider_specific".into(), json!(true));
-    let (_, result) = state.providers.call(arguments).await.unwrap();
-    assert_eq!(result.is_error, Some(false));
-    assert_eq!(mock.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for tool in canonical_tools() {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("provider_specific".into(), json!(true));
+        let (_, result) = state
+            .providers
+            .call(tool.name.as_ref(), arguments)
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            mock.last_tool.lock().unwrap().as_deref(),
+            Some(format!("search_proxy_{}", tool.name).as_str())
+        );
+    }
+    assert_eq!(
+        mock.calls.load(std::sync::atomic::Ordering::SeqCst),
+        canonical_tools().len()
+    );
     mock.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut arguments = serde_json::Map::new();
     arguments.insert("provider_specific".into(), json!(false));
-    let failure = state.providers.call(arguments).await.unwrap_err();
+    let failure = state
+        .providers
+        .call("tavily_extract", arguments)
+        .await
+        .unwrap_err();
     assert_eq!(failure.provider_id, Some(provider_id));
-    assert_eq!(mock.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        mock.calls.load(std::sync::atomic::Ordering::SeqCst),
+        canonical_tools().len() + 1
+    );
+    assert_eq!(
+        mock.last_tool.lock().unwrap().as_deref(),
+        Some("search_proxy_tavily_extract")
+    );
     task.abort();
 }
 
@@ -611,5 +778,16 @@ async fn enabled_provider_creation_connects_before_activation() {
     let created = body_json(created).await;
     assert!(created["id"].is_number());
     assert!(state.providers.has_providers());
+    let unsupported = state
+        .providers
+        .call("tavily_extract", serde_json::Map::new())
+        .await
+        .unwrap_err();
+    assert_eq!(unsupported.provider_id, None);
+    assert_eq!(
+        mock.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a provider that did not advertise a tool must not receive that call"
+    );
     task.abort();
 }
