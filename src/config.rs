@@ -1,11 +1,16 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
-#[derive(Clone)]
 pub struct Config {
     pub bind: SocketAddr,
     pub database_url: String,
     pub admin_username: String,
     pub admin_password: Option<String>,
+    pub production: bool,
+    pub public_origin: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct WebSecurity {
     pub production: bool,
     pub public_origin: Option<String>,
 }
@@ -32,5 +37,12 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         Ok(())
+    }
+
+    pub fn web_security(&self) -> WebSecurity {
+        WebSecurity {
+            production: self.production,
+            public_origin: self.public_origin.clone(),
+        }
     }
 }

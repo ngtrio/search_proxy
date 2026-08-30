@@ -22,9 +22,10 @@ use tavily_mcp_gateway::{
     AppState, admin, app,
     auth::digest,
     catalog::canonical_tools,
-    config::Config,
-    db::{Database, NewProvider},
-    provider::ProviderRegistry,
+    config::WebSecurity,
+    db::{Database, NewProvider, ProviderUpdate},
+    gateway::ToolGateway,
+    provider::ProviderManager,
 };
 use tower::ServiceExt;
 
@@ -117,25 +118,25 @@ async fn state() -> (AppState, tempfile::TempDir) {
         dir.path().join("gateway.db").display()
     );
     let db = Database::connect(&database_url).await.expect("database");
-    let config = Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        database_url,
-        admin_username: "admin".into(),
-        admin_password: Some("correct horse battery staple".into()),
+    let web_security = WebSecurity {
         production: false,
         public_origin: None,
     };
     let providers = Arc::new(
-        ProviderRegistry::new(db.clone())
+        ProviderManager::new(db.clone())
             .await
             .expect("load providers"),
     );
+    let tool_gateway = Arc::new(ToolGateway::new(db.clone(), Arc::clone(&providers)));
     let state = AppState {
         db,
         providers,
-        config,
+        gateway: tool_gateway,
+        web_security,
     };
-    admin::bootstrap(&state).await.expect("bootstrap");
+    admin::bootstrap(&state.db, "admin", Some("correct horse battery staple"))
+        .await
+        .expect("bootstrap");
     (state, dir)
 }
 
@@ -456,10 +457,13 @@ async fn admin_csrf_write_only_tokens_and_login_throttle() {
 
 #[tokio::test]
 async fn provider_schema_has_no_probe_or_cooldown_state() {
-    let (state, _dir) = state().await;
-    let pool = SqlitePool::connect(&state.config.database_url)
-        .await
-        .unwrap();
+    let (_state, dir) = state().await;
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("gateway.db").display()
+    ))
+    .await
+    .unwrap();
     let provider_columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('providers')")
             .fetch_all(&pool)
@@ -487,10 +491,13 @@ async fn provider_schema_has_no_probe_or_cooldown_state() {
 
 #[tokio::test]
 async fn settings_have_no_removed_maintenance_controls() {
-    let (state, _dir) = state().await;
-    let pool = SqlitePool::connect(&state.config.database_url)
-        .await
-        .unwrap();
+    let (_state, dir) = state().await;
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("gateway.db").display()
+    ))
+    .await
+    .unwrap();
     let removed_settings: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM settings WHERE key IN ('retention_days','default_cooldown_seconds')",
     )
@@ -502,10 +509,13 @@ async fn settings_have_no_removed_maintenance_controls() {
 
 #[tokio::test]
 async fn tool_calls_write_metadata_and_daily_aggregates_only() {
-    let (state, _dir) = state().await;
-    let pool = SqlitePool::connect(&state.config.database_url)
-        .await
-        .unwrap();
+    let (state, dir) = state().await;
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("gateway.db").display()
+    ))
+    .await
+    .unwrap();
     let secret = "tmg_usage";
     state
         .db
@@ -671,11 +681,11 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     let (state, _dir) = state().await;
     let endpoint = format!("http://{address}/mcp");
     let provider_id = state
-        .db
-        .create_provider(NewProvider {
+        .providers
+        .create(NewProvider {
             kind: "searchix".into(),
             name: "mock".into(),
-            endpoint,
+            endpoint: endpoint.clone(),
             bearer_token: "test".into(),
             weight: 1,
             enabled: true,
@@ -683,9 +693,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
         })
         .await
         .unwrap();
-    let provider = state.db.provider(provider_id).await.unwrap().unwrap();
-    state.providers.add(provider).await.unwrap();
-    for tool in canonical_tools() {
+    for tool in state.gateway.tools() {
         let mut arguments = serde_json::Map::new();
         arguments.insert("provider_specific".into(), json!(true));
         let (_, result) = state
@@ -701,7 +709,7 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     }
     assert_eq!(
         mock.calls.load(std::sync::atomic::Ordering::SeqCst),
-        canonical_tools().len()
+        state.gateway.tools().len()
     );
     mock.fail.store(true, std::sync::atomic::Ordering::SeqCst);
     let mut arguments = serde_json::Map::new();
@@ -714,13 +722,80 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     assert_eq!(failure.provider_id, Some(provider_id));
     assert_eq!(
         mock.calls.load(std::sync::atomic::Ordering::SeqCst),
-        canonical_tools().len() + 1
+        state.gateway.tools().len() + 1
     );
     assert_eq!(
         mock.last_tool.lock().unwrap().as_deref(),
         Some("search_proxy_tavily_extract")
     );
+    mock.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("provider_specific".into(), json!(true));
+    let (_, recovered) = state
+        .providers
+        .call("tavily_extract", arguments)
+        .await
+        .unwrap();
+    assert_eq!(recovered.is_error, Some(false));
+
+    let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_address = closed_listener.local_addr().unwrap();
+    drop(closed_listener);
+    let failed_update = state
+        .providers
+        .update_config(
+            provider_id,
+            ProviderUpdate {
+                kind: "searchix".into(),
+                name: "unreachable replacement".into(),
+                endpoint: format!("http://{closed_address}/mcp"),
+                bearer_token: None,
+                weight: 2,
+                enabled: true,
+                timeout_seconds: 1,
+            },
+        )
+        .await;
+    assert!(failed_update.is_err());
+    let stored = state.db.provider(provider_id).await.unwrap().unwrap();
+    assert_eq!(stored.endpoint, endpoint);
+    assert_eq!(stored.weight, 1);
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("provider_specific".into(), json!(true));
+    assert!(
+        state
+            .providers
+            .call("tavily_search", arguments)
+            .await
+            .is_ok()
+    );
     task.abort();
+}
+
+#[tokio::test]
+async fn failed_provider_connections_do_not_poison_persistence_or_startup() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    let (state, _dir) = state().await;
+    let unreachable = NewProvider {
+        kind: "searchix".into(),
+        name: "unreachable".into(),
+        endpoint: format!("http://{address}/mcp"),
+        bearer_token: "test".into(),
+        weight: 1,
+        enabled: true,
+        timeout_seconds: 1,
+    };
+    assert!(state.providers.create(unreachable.clone()).await.is_err());
+    assert!(state.db.provider_summaries().await.unwrap().is_empty());
+
+    state.db.create_provider(unreachable).await.unwrap();
+    let loaded = ProviderManager::new(state.db.clone())
+        .await
+        .expect("an unavailable provider must not prevent the control plane from starting");
+    assert!(!loaded.has_providers());
 }
 
 #[tokio::test]

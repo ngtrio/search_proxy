@@ -27,7 +27,7 @@ pub struct ProviderSummary {
     pub token_configured: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewProvider {
     pub kind: String,
     pub name: String,
@@ -38,7 +38,7 @@ pub struct NewProvider {
     pub timeout_seconds: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderUpdate {
     pub kind: String,
     pub name: String,

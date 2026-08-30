@@ -3,12 +3,11 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use anyhow::Context;
 use rmcp::service::RunningService;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
@@ -24,7 +23,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     catalog::canonical_tools,
-    db::{Database, ProviderConfig},
+    db::{Database, NewProvider, ProviderConfig, ProviderUpdate},
     router::WeightedRandom,
 };
 
@@ -35,7 +34,7 @@ pub enum ProviderError {
     #[error("provider timed out")]
     Timeout,
     #[error("provider rate limited the request")]
-    RateLimited(Option<u64>),
+    RateLimited,
     #[error("provider session expired")]
     SessionExpired,
     #[error("provider request failed")]
@@ -49,7 +48,7 @@ impl ProviderError {
         match self {
             Self::Unavailable(_) => "unavailable",
             Self::Timeout => "timeout",
-            Self::RateLimited(_) => "rate_limited",
+            Self::RateLimited => "rate_limited",
             Self::SessionExpired => "session_expired",
             Self::Transport => "transport",
             Self::Upstream => "upstream",
@@ -62,6 +61,16 @@ impl ProviderError {
 pub struct ProviderFailure {
     pub provider_id: Option<i64>,
     pub error: ProviderError,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderMutationError {
+    #[error("invalid provider configuration: {0}")]
+    Invalid(&'static str),
+    #[error("provider connection validation failed")]
+    Connection(#[source] anyhow::Error),
+    #[error("provider persistence failed")]
+    Storage(#[from] sqlx::Error),
 }
 
 impl ProviderFailure {
@@ -86,35 +95,169 @@ impl ProviderFailure {
 
 struct ConnectedProvider {
     id: i64,
+    weight: i64,
     kind: String,
     endpoint: String,
     bearer_token: String,
     timeout_seconds: AtomicU64,
+    reconnect_required: AtomicBool,
     upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
 }
 
-pub struct ProviderRegistry {
+pub struct ProviderManager {
+    db: Database,
     router: RwLock<WeightedRandom<Arc<ConnectedProvider>>>,
+    reconnect_lock: tokio::sync::Mutex<()>,
 }
 
-impl ProviderRegistry {
+impl ProviderManager {
     pub async fn new(db: Database) -> anyhow::Result<Self> {
         let registry = Self {
+            db: db.clone(),
             router: RwLock::new(WeightedRandom::default()),
+            reconnect_lock: tokio::sync::Mutex::new(()),
         };
         for provider in db.providers().await? {
             let description = format!("{} ({})", provider.name, provider.id);
-            registry
-                .add(provider)
-                .await
-                .with_context(|| format!("failed to connect provider {description}"))?;
+            if let Err(error) = registry.activate(provider).await {
+                tracing::warn!(%error, provider = description, "provider unavailable during startup");
+            }
         }
         Ok(registry)
     }
 
-    /// Adds one provider to the live router without touching existing connections.
-    pub async fn add(&self, provider: ProviderConfig) -> anyhow::Result<()> {
+    /// Validates an enabled provider before persisting it, then installs the
+    /// already-connected client into the live router.
+    pub async fn create(&self, provider: NewProvider) -> Result<i64, ProviderMutationError> {
+        validate_provider(
+            &provider.kind,
+            &provider.name,
+            &provider.endpoint,
+            &provider.bearer_token,
+            provider.weight,
+            provider.timeout_seconds,
+        )?;
+        let prepared = if provider.enabled {
+            Some(
+                connect(
+                    &provider.kind,
+                    &provider.endpoint,
+                    &provider.bearer_token,
+                    provider.timeout_seconds,
+                    canonical_tools(),
+                )
+                .await
+                .map_err(ProviderMutationError::Connection)?,
+            )
+        } else {
+            None
+        };
+
+        let id = match self.db.create_provider(provider.clone()).await {
+            Ok(id) => id,
+            Err(error) => {
+                if let Some((mut client, _)) = prepared {
+                    let _ = client.close().await;
+                }
+                return Err(ProviderMutationError::Storage(error));
+            }
+        };
+        if let Some((client, upstream_tools)) = prepared {
+            self.install(ConnectedProvider::from_new(
+                id,
+                provider,
+                client,
+                upstream_tools,
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Validates connection-changing updates before persistence. Once the
+    /// database write succeeds, applying the prepared runtime state cannot fail.
+    pub async fn update_config(
+        &self,
+        id: i64,
+        update: ProviderUpdate,
+    ) -> Result<bool, ProviderMutationError> {
+        let Some(current_config) = self.db.provider(id).await? else {
+            return Ok(false);
+        };
+        let desired = ProviderConfig {
+            id,
+            kind: update.kind.clone(),
+            name: update.name.clone(),
+            endpoint: update.endpoint.clone(),
+            bearer_token: update
+                .bearer_token
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .unwrap_or(&current_config.bearer_token)
+                .to_owned(),
+            weight: update.weight,
+            enabled: update.enabled,
+            timeout_seconds: update.timeout_seconds,
+        };
+        validate_provider(
+            &desired.kind,
+            &desired.name,
+            &desired.endpoint,
+            &desired.bearer_token,
+            desired.weight,
+            desired.timeout_seconds,
+        )?;
+        let live = self.find(id);
+        let can_reuse = live.as_ref().is_some_and(|provider| {
+            provider.has_same_connection(&desired)
+                && !provider.reconnect_required.load(Ordering::Acquire)
+        });
+        let prepared = if desired.enabled && !can_reuse {
+            Some(
+                connect_config(&desired, canonical_tools())
+                    .await
+                    .map_err(ProviderMutationError::Connection)?,
+            )
+        } else {
+            None
+        };
+
+        let updated = match self.db.update_provider(id, update).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Some((mut client, _)) = prepared {
+                    let _ = client.close().await;
+                }
+                return Err(ProviderMutationError::Storage(error));
+            }
+        };
+        if !updated {
+            if let Some((mut client, _)) = prepared {
+                let _ = client.close().await;
+            }
+            return Ok(false);
+        }
+
+        if !desired.enabled {
+            self.remove(id);
+        } else if let Some((client, upstream_tools)) = prepared {
+            self.install(ConnectedProvider::new(desired, client, upstream_tools));
+        } else if let Some(provider) = live {
+            provider
+                .timeout_seconds
+                .store(desired.timeout_seconds as u64, Ordering::Relaxed);
+            self.router
+                .write()
+                .expect("provider router poisoned")
+                .upsert(provider, desired.weight, |provider| provider.id == id);
+        }
+        Ok(true)
+    }
+
+    /// Adds an already-persisted provider to the live router. Used during
+    /// startup and by integration setup; configuration mutations should use
+    /// `create` or `update_config`.
+    async fn activate(&self, provider: ProviderConfig) -> anyhow::Result<()> {
         if !provider.enabled {
             return Ok(());
         }
@@ -129,7 +272,7 @@ impl ProviderRegistry {
         }
         let id = provider.id;
         let weight = provider.weight;
-        let (client, upstream_tools) = connect(&provider).await?;
+        let (client, upstream_tools) = connect_config(&provider, canonical_tools()).await?;
         let connected = Arc::new(ConnectedProvider::new(provider, client, upstream_tools));
         let mut router = self.router.write().expect("provider router poisoned");
         if router.find(|current| current.id == id).is_some() {
@@ -139,47 +282,8 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Applies one provider's configuration, reconnecting only when connection
-    /// parameters changed or when a disabled provider becomes enabled.
-    pub async fn update(&self, provider: ProviderConfig) -> anyhow::Result<()> {
-        let previous = self
-            .router
-            .read()
-            .expect("provider router poisoned")
-            .find(|current| current.id == provider.id)
-            .cloned();
-
-        if !provider.enabled {
-            self.router
-                .write()
-                .expect("provider router poisoned")
-                .remove(|current| current.id == provider.id);
-            return Ok(());
-        }
-
-        let id = provider.id;
-        let weight = provider.weight;
-        let connected = match previous.as_ref() {
-            Some(current) if current.has_same_connection(&provider) => {
-                current
-                    .timeout_seconds
-                    .store(provider.timeout_seconds as u64, Ordering::Relaxed);
-                Arc::clone(current)
-            }
-            _ => {
-                let (client, upstream_tools) = connect(&provider).await?;
-                Arc::new(ConnectedProvider::new(provider, client, upstream_tools))
-            }
-        };
-        self.router
-            .write()
-            .expect("provider router poisoned")
-            .upsert(connected, weight, |current| current.id == id);
-        Ok(())
-    }
-
     /// Removes one provider from routing and closes only its connection.
-    pub fn remove(&self, id: i64) {
+    fn remove(&self, id: i64) {
         self.router
             .write()
             .expect("provider router poisoned")
@@ -199,15 +303,11 @@ impl ProviderRegistry {
         tool_name: &str,
         arguments: Map<String, Value>,
     ) -> Result<(i64, CallToolResult), ProviderFailure> {
-        let provider = self
-            .router
-            .read()
-            .expect("provider router poisoned")
-            .next_provider_matching(|provider| provider.upstream_tools.contains_key(tool_name))
-            .cloned()
-            .ok_or_else(|| {
-                ProviderFailure::before_routing(ProviderError::Unavailable(tool_name.to_owned()))
-            })?;
+        let mut provider = self.select(tool_name)?;
+        if provider.reconnect_required.load(Ordering::Acquire) {
+            self.reconnect(provider.id).await?;
+            provider = self.select(tool_name)?;
+        }
         let id = provider.id;
         let upstream_name = provider
             .upstream_tools
@@ -229,14 +329,109 @@ impl ProviderRegistry {
                 let returned = if text.contains("session expired") {
                     ProviderError::SessionExpired
                 } else if text.contains("429") || text.contains("rate limit") {
-                    ProviderError::RateLimited(None)
+                    ProviderError::RateLimited
                 } else {
                     ProviderError::Transport
                 };
+                if matches!(
+                    returned,
+                    ProviderError::SessionExpired | ProviderError::Transport
+                ) {
+                    provider.reconnect_required.store(true, Ordering::Release);
+                }
                 Err(ProviderFailure::after_routing(id, returned))
             }
         }
     }
+
+    fn select(&self, tool_name: &str) -> Result<Arc<ConnectedProvider>, ProviderFailure> {
+        self.router
+            .read()
+            .expect("provider router poisoned")
+            .next_provider_matching(|provider| provider.upstream_tools.contains_key(tool_name))
+            .cloned()
+            .ok_or_else(|| {
+                ProviderFailure::before_routing(ProviderError::Unavailable(tool_name.to_owned()))
+            })
+    }
+
+    fn find(&self, id: i64) -> Option<Arc<ConnectedProvider>> {
+        self.router
+            .read()
+            .expect("provider router poisoned")
+            .find(|provider| provider.id == id)
+            .cloned()
+    }
+
+    fn install(&self, provider: ConnectedProvider) {
+        let id = provider.id;
+        let weight = provider.weight;
+        self.router
+            .write()
+            .expect("provider router poisoned")
+            .upsert(Arc::new(provider), weight, |provider| provider.id == id);
+    }
+
+    async fn reconnect(&self, id: i64) -> Result<(), ProviderFailure> {
+        let _guard = self.reconnect_lock.lock().await;
+        if self
+            .find(id)
+            .is_some_and(|provider| !provider.reconnect_required.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let config = self
+            .db
+            .provider(id)
+            .await
+            .map_err(|_| ProviderFailure::after_routing(id, ProviderError::Transport))?
+            .filter(|provider| provider.enabled)
+            .ok_or_else(|| {
+                ProviderFailure::after_routing(id, ProviderError::Unavailable(id.to_string()))
+            })?;
+        let (client, upstream_tools) = connect_config(&config, canonical_tools())
+            .await
+            .map_err(|_| ProviderFailure::after_routing(id, ProviderError::Transport))?;
+        self.install(ConnectedProvider::new(config, client, upstream_tools));
+        Ok(())
+    }
+}
+
+fn validate_provider(
+    kind: &str,
+    name: &str,
+    endpoint: &str,
+    bearer_token: &str,
+    weight: i64,
+    timeout_seconds: i64,
+) -> Result<(), ProviderMutationError> {
+    if !["searchix", "tavily_hikari"].contains(&kind) {
+        return Err(ProviderMutationError::Invalid("unsupported provider kind"));
+    }
+    if name.trim().is_empty() {
+        return Err(ProviderMutationError::Invalid("name is required"));
+    }
+    if bearer_token.is_empty() {
+        return Err(ProviderMutationError::Invalid("bearer token is required"));
+    }
+    let endpoint = endpoint
+        .parse::<url::Url>()
+        .map_err(|_| ProviderMutationError::Invalid("endpoint is not a valid URL"))?;
+    if !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || (endpoint.scheme() != "https" && endpoint.host_str() != Some("127.0.0.1"))
+    {
+        return Err(ProviderMutationError::Invalid(
+            "endpoint must use HTTPS unless it targets 127.0.0.1",
+        ));
+    }
+    if weight <= 0 {
+        return Err(ProviderMutationError::Invalid("weight must be positive"));
+    }
+    if timeout_seconds <= 0 {
+        return Err(ProviderMutationError::Invalid("timeout must be positive"));
+    }
+    Ok(())
 }
 
 impl ConnectedProvider {
@@ -247,10 +442,31 @@ impl ConnectedProvider {
     ) -> Self {
         Self {
             id: provider.id,
+            weight: provider.weight,
             kind: provider.kind,
             endpoint: provider.endpoint,
             bearer_token: provider.bearer_token,
             timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
+            reconnect_required: AtomicBool::new(false),
+            upstream_tools,
+            client,
+        }
+    }
+
+    fn from_new(
+        id: i64,
+        provider: NewProvider,
+        client: RunningService<RoleClient, ClientInfo>,
+        upstream_tools: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            weight: provider.weight,
+            kind: provider.kind,
+            endpoint: provider.endpoint,
+            bearer_token: provider.bearer_token,
+            timeout_seconds: AtomicU64::new(provider.timeout_seconds as u64),
+            reconnect_required: AtomicBool::new(false),
             upstream_tools,
             client,
         }
@@ -263,20 +479,41 @@ impl ConnectedProvider {
     }
 }
 
-async fn connect(
+async fn connect_config(
     provider: &ProviderConfig,
+    canonical_tools: &[rmcp::model::Tool],
+) -> anyhow::Result<(
+    RunningService<RoleClient, ClientInfo>,
+    HashMap<String, String>,
+)> {
+    connect(
+        &provider.kind,
+        &provider.endpoint,
+        &provider.bearer_token,
+        provider.timeout_seconds,
+        canonical_tools,
+    )
+    .await
+}
+
+async fn connect(
+    kind: &str,
+    endpoint: &str,
+    bearer_token: &str,
+    timeout_seconds: i64,
+    canonical_tools: &[rmcp::model::Tool],
 ) -> anyhow::Result<(
     RunningService<RoleClient, ClientInfo>,
     HashMap<String, String>,
 )> {
     let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(provider.endpoint.clone())
-            .auth_header(provider.bearer_token.clone())
+        StreamableHttpClientTransportConfig::with_uri(endpoint.to_owned())
+            .auth_header(bearer_token.to_owned())
             // An in-flight tool call must never be replayed after session recovery.
             .reinit_on_expired_session(false),
     );
     let mut client = tokio::time::timeout(
-        Duration::from_secs(provider.timeout_seconds as u64),
+        Duration::from_secs(timeout_seconds as u64),
         ClientInfo::default().serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Auto {
@@ -295,7 +532,7 @@ async fn connect(
                 .clone()
                 .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
             let page = tokio::time::timeout(
-                Duration::from_secs(provider.timeout_seconds as u64),
+                Duration::from_secs(timeout_seconds as u64),
                 client.list_tools(params),
             )
             .await
@@ -309,10 +546,10 @@ async fn connect(
             }
         }
 
-        let mapped = canonical_tools()
+        let mapped = canonical_tools
             .iter()
             .filter_map(|tool| {
-                mapped_name_candidates(&provider.kind, tool.name.as_ref())
+                mapped_name_candidates(kind, tool.name.as_ref())
                     .into_iter()
                     .find(|upstream_name| upstream_names.contains(upstream_name.as_ref()))
                     .map(|upstream_name| (tool.name.to_string(), upstream_name.into_owned()))
@@ -333,7 +570,7 @@ async fn connect(
     }
 }
 
-pub fn mapped_name_candidates<'a>(kind: &str, canonical_name: &'a str) -> Vec<Cow<'a, str>> {
+fn mapped_name_candidates<'a>(kind: &str, canonical_name: &'a str) -> Vec<Cow<'a, str>> {
     if kind == "searchix" {
         vec![
             Cow::Owned(format!("search_proxy_{canonical_name}")),

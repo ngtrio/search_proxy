@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tavily_mcp_gateway::{
-    AppState, admin, app, config::Config, db::Database, provider::ProviderRegistry,
+    AppState, admin, app, config::Config, db::Database, gateway::ToolGateway,
+    provider::ProviderManager,
 };
 
 #[tokio::main]
@@ -15,13 +16,20 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     config.ensure_data_dir()?;
     let db = Database::connect(&config.database_url).await?;
-    let providers = Arc::new(ProviderRegistry::new(db.clone()).await?);
+    admin::bootstrap(
+        &db,
+        &config.admin_username,
+        config.admin_password.as_deref(),
+    )
+    .await?;
+    let providers = Arc::new(ProviderManager::new(db.clone()).await?);
+    let gateway = Arc::new(ToolGateway::new(db.clone(), Arc::clone(&providers)));
     let state = AppState {
         db,
         providers,
-        config: config.clone(),
+        gateway,
+        web_security: config.web_security(),
     };
-    admin::bootstrap(&state).await?;
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind=%config.bind,"gateway listening");
     axum::serve(listener, app(state)).await?;

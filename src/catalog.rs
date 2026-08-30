@@ -12,7 +12,7 @@ struct PinnedCatalog {
 
 static CANONICAL_TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str::<PinnedCatalog>(PINNED_CATALOG_JSON)
-        .expect("pinned Tavily MCP catalog must be valid")
+        .expect("embedded Tavily MCP catalog must be valid")
         .tools
 });
 
@@ -20,7 +20,8 @@ pub fn canonical_tools() -> &'static [Tool] {
     &CANONICAL_TOOLS
 }
 
-pub fn canonical_tool(name: &str) -> Option<&'static Tool> {
+pub fn canonical_tool(name: impl AsRef<str>) -> Option<&'static Tool> {
+    let name = name.as_ref();
     CANONICAL_TOOLS.iter().find(|tool| tool.name == name)
 }
 

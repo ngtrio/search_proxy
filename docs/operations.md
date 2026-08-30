@@ -8,6 +8,8 @@ Copy `.env.example` to `.env`, set a long administrator password and the exact p
 
 Readiness (`/health/ready`) requires a migrated database and one connected provider. Liveness (`/health/live`) only confirms that the process responds.
 
+An unavailable provider is logged and skipped during startup so the administration plane remains available for recovery. The gateway becomes ready when at least one enabled provider connects successfully.
+
 ## Reverse proxy
 
 Nginx:

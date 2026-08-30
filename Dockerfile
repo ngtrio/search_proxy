@@ -1,10 +1,9 @@
 FROM node:22-alpine AS web
-WORKDIR /app
-COPY pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY web/package.json web/package.json
+WORKDIR /app/web
+COPY web/package.json web/pnpm-lock.yaml ./
 RUN corepack enable && pnpm install --frozen-lockfile
-COPY web web
-RUN pnpm --dir web build
+COPY web .
+RUN pnpm build
 
 FROM rust:1.88-bookworm AS rust
 WORKDIR /app

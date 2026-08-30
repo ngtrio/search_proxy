@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{FromRequestParts, Path, State},
+    http::{HeaderMap, StatusCode, header, request::Parts},
     response::IntoResponse,
     routing::{get, post, put},
 };
@@ -14,6 +14,7 @@ use crate::{
     AppState,
     auth::{digest, hash_password, random_secret, verify_digest, verify_password},
     db::{GatewaySettings, NewProvider, ProviderUpdate},
+    provider::ProviderMutationError,
 };
 
 pub fn routes() -> Router<AppState> {
@@ -31,15 +32,14 @@ pub fn routes() -> Router<AppState> {
 }
 
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = state.db.health_check().await.is_ok();
-    let ready = db_ok && state.providers.has_providers();
+    let readiness = state.gateway.readiness().await;
     (
-        if ready {
+        if readiness.ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        Json(json!({"ready":ready,"database":db_ok})),
+        Json(json!({"ready":readiness.ready,"database":readiness.database})),
     )
 }
 
@@ -75,6 +75,8 @@ struct Login {
     username: String,
     password: String,
 }
+const ADMIN_LOGIN_THROTTLE_ID: &str = "administrator";
+
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -83,7 +85,18 @@ async fn login(
     if !same_origin(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let locked = match state.db.admin_login_is_locked(&input.username).await {
+    if input.username.len() > 128 || input.password.len() > 1024 {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"invalid credentials"})),
+        )
+            .into_response();
+    }
+    let locked = match state
+        .db
+        .admin_login_is_locked(ADMIN_LOGIN_THROTTLE_ID)
+        .await
+    {
         Ok(locked) => locked,
         Err(error) => {
             tracing::error!(%error, "could not read admin login throttle");
@@ -104,12 +117,32 @@ async fn login(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let authenticated = credentials.as_ref().is_some_and(|credentials| {
-        credentials.username == input.username
-            && verify_password(&input.password, &credentials.password_hash)
-    });
+    let authenticated = match credentials {
+        Some(credentials) => {
+            let supplied_username = input.username;
+            let supplied_password = input.password;
+            match tokio::task::spawn_blocking(move || {
+                let password_matches =
+                    verify_password(&supplied_password, &credentials.password_hash);
+                password_matches && credentials.username == supplied_username
+            })
+            .await
+            {
+                Ok(authenticated) => authenticated,
+                Err(error) => {
+                    tracing::error!(%error, "administrator password verification failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        None => false,
+    };
     if !authenticated {
-        if let Err(error) = state.db.record_admin_login_failure(&input.username).await {
+        if let Err(error) = state
+            .db
+            .record_admin_login_failure(ADMIN_LOGIN_THROTTLE_ID)
+            .await
+        {
             tracing::warn!(%error, "could not record admin login failure");
         }
         return (
@@ -118,7 +151,11 @@ async fn login(
         )
             .into_response();
     }
-    if let Err(error) = state.db.clear_admin_login_failures(&input.username).await {
+    if let Err(error) = state
+        .db
+        .clear_admin_login_failures(ADMIN_LOGIN_THROTTLE_ID)
+        .await
+    {
         tracing::warn!(%error, "could not clear admin login throttle");
     }
     let token = random_secret(32);
@@ -135,7 +172,7 @@ async fn login(
         tracing::error!(%error, "could not create admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let secure = if state.config.production {
+    let secure = if state.web_security.production {
         "; Secure"
     } else {
         ""
@@ -161,19 +198,10 @@ async fn login(
     response
 }
 
-async fn session(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    match admin_auth(&state, &headers, false).await {
-        Some(_) => (StatusCode::OK, Json(json!({"authenticated":true}))),
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"authenticated":false})),
-        ),
-    }
+async fn session(_auth: AdminRead) -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({"authenticated":true})))
 }
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let Some(id) = admin_auth(&state, &headers, true).await else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
+async fn logout(AdminWrite(id): AdminWrite, State(state): State<AppState>) -> impl IntoResponse {
     if let Err(error) = state.db.delete_admin_session(&id).await {
         tracing::error!(%error, "could not delete admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -220,17 +248,45 @@ async fn admin_auth(state: &AppState, headers: &HeaderMap, write: bool) -> Optio
     Some(session.id)
 }
 
+struct AdminRead;
+struct AdminWrite(String);
+
+impl FromRequestParts<AppState> for AdminRead {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        admin_auth(state, &parts.headers, false)
+            .await
+            .map(|_| Self)
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
+
+impl FromRequestParts<AppState> for AdminWrite {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        admin_auth(state, &parts.headers, true)
+            .await
+            .map(Self)
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
+}
+
 fn same_origin(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = &state.config.public_origin else {
-        return !state.config.production;
+    let Some(expected) = &state.web_security.public_origin else {
+        return !state.web_security.production;
     };
     headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(expected.as_str())
 }
 
-async fn keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if admin_auth(&state, &headers, false).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+async fn keys(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.client_key_summaries().await {
         Ok(rows) => Json(rows).into_response(),
         Err(error) => {
@@ -244,13 +300,10 @@ struct Name {
     name: String,
 }
 async fn create_key(
+    _auth: AdminWrite,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(input): Json<Name>,
 ) -> impl IntoResponse {
-    if admin_auth(&state, &headers, true).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     if input.name.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -273,13 +326,10 @@ async fn create_key(
     }
 }
 async fn revoke_key(
+    _auth: AdminWrite,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if admin_auth(&state, &headers, true).await.is_none() {
-        return StatusCode::UNAUTHORIZED;
-    }
     match state.db.revoke_client_key(id).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(error) => {
@@ -289,10 +339,7 @@ async fn revoke_key(
     }
 }
 
-async fn providers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if admin_auth(&state, &headers, false).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+async fn providers(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.provider_summaries().await {
         Ok(rows) => Json(rows).into_response(),
         Err(error) => {
@@ -312,22 +359,16 @@ struct ProviderInput {
     timeout_seconds: i64,
 }
 async fn create_provider(
+    _auth: AdminWrite,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(input): Json<ProviderInput>,
 ) -> impl IntoResponse {
-    if admin_auth(&state, &headers, true).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if !valid_provider(&input) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let Some(token) = input.token.filter(|token| !token.is_empty()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let id = match state
-        .db
-        .create_provider(NewProvider {
+        .providers
+        .create(NewProvider {
             kind: input.kind,
             name: input.name,
             endpoint: input.endpoint,
@@ -339,43 +380,30 @@ async fn create_provider(
         .await
     {
         Ok(id) => id,
-        Err(error) => {
-            tracing::warn!(%error, "could not create provider");
+        Err(ProviderMutationError::Invalid(error)) => {
+            tracing::warn!(error, "invalid provider configuration");
             return StatusCode::BAD_REQUEST.into_response();
         }
-    };
-    let provider = match state.db.provider(id).await {
-        Ok(Some(provider)) => provider,
-        Ok(None) => {
-            tracing::error!(provider_id = id, "created provider could not be reloaded");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        Err(ProviderMutationError::Connection(error)) => {
+            tracing::warn!(%error, "could not connect provider");
+            return StatusCode::BAD_GATEWAY.into_response();
         }
-        Err(error) => {
-            tracing::error!(%error, provider_id = id, "could not reload created provider");
+        Err(ProviderMutationError::Storage(error)) => {
+            tracing::error!(%error, "could not persist provider");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if let Err(error) = state.providers.add(provider).await {
-        tracing::warn!(%error, provider_id = id, "could not activate created provider");
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
     (StatusCode::CREATED, Json(json!({"id":id}))).into_response()
 }
 async fn update_provider(
+    _auth: AdminWrite,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<ProviderInput>,
 ) -> impl IntoResponse {
-    if admin_auth(&state, &headers, true).await.is_none() {
-        return StatusCode::UNAUTHORIZED;
-    }
-    if !valid_provider(&input) {
-        return StatusCode::BAD_REQUEST;
-    }
     let updated = match state
-        .db
-        .update_provider(
+        .providers
+        .update_config(
             id,
             ProviderUpdate {
                 kind: input.kind,
@@ -390,43 +418,25 @@ async fn update_provider(
         .await
     {
         Ok(updated) => updated,
-        Err(error) => {
-            tracing::error!(%error, provider_id = id, "could not update provider");
+        Err(ProviderMutationError::Invalid(error)) => {
+            tracing::warn!(error, provider_id = id, "invalid provider configuration");
+            return StatusCode::BAD_REQUEST;
+        }
+        Err(ProviderMutationError::Connection(error)) => {
+            tracing::warn!(%error, provider_id = id, "could not connect updated provider");
+            return StatusCode::BAD_GATEWAY;
+        }
+        Err(ProviderMutationError::Storage(error)) => {
+            tracing::error!(%error, provider_id = id, "could not persist provider update");
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
     if !updated {
         return StatusCode::NOT_FOUND;
     }
-    let provider = match state.db.provider(id).await {
-        Ok(Some(provider)) => provider,
-        Ok(None) => return StatusCode::NOT_FOUND,
-        Err(error) => {
-            tracing::error!(%error, provider_id = id, "could not reload updated provider");
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
-    };
-    if let Err(error) = state.providers.update(provider).await {
-        tracing::warn!(%error, provider_id = id, "could not apply provider update");
-        return StatusCode::BAD_GATEWAY;
-    }
     StatusCode::NO_CONTENT
 }
-fn valid_provider(p: &ProviderInput) -> bool {
-    ["searchix", "tavily_hikari"].contains(&p.kind.as_str())
-        && !p.name.trim().is_empty()
-        && p.endpoint.parse::<url::Url>().is_ok_and(|u| {
-            u.username().is_empty()
-                && u.password().is_none()
-                && (u.scheme() == "https" || u.host_str() == Some("127.0.0.1"))
-        })
-        && p.weight > 0
-        && p.timeout_seconds > 0
-}
-async fn overview(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if admin_auth(&state, &headers, false).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+async fn overview(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.usage_overview().await {
         Ok(overview) => Json(overview).into_response(),
         Err(error) => {
@@ -435,10 +445,7 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> impl Int
         }
     }
 }
-async fn requests(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if admin_auth(&state, &headers, false).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+async fn requests(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.recent_requests().await {
         Ok(requests) => Json(requests).into_response(),
         Err(error) => {
@@ -447,10 +454,7 @@ async fn requests(State(state): State<AppState>, headers: HeaderMap) -> impl Int
         }
     }
 }
-async fn settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if admin_auth(&state, &headers, false).await.is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+async fn settings(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.settings().await {
         Ok(settings) => Json(settings).into_response(),
         Err(error) => {
@@ -465,13 +469,10 @@ struct SettingsInput {
     default_timeout_seconds: i64,
 }
 async fn update_settings(
+    _auth: AdminWrite,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(input): Json<SettingsInput>,
 ) -> impl IntoResponse {
-    if admin_auth(&state, &headers, true).await.is_none() {
-        return StatusCode::UNAUTHORIZED;
-    }
     if input.default_timeout_seconds <= 0 {
         return StatusCode::BAD_REQUEST;
     }
@@ -490,15 +491,16 @@ async fn update_settings(
     }
 }
 
-pub async fn bootstrap(state: &AppState) -> anyhow::Result<()> {
-    if let Some(password) = &state.config.admin_password {
+pub async fn bootstrap(
+    db: &crate::db::Database,
+    username: &str,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(password) = password {
         let hash = hash_password(password)?;
-        state
-            .db
-            .insert_admin_if_missing(&state.config.admin_username, &hash)
-            .await?;
+        db.insert_admin_if_missing(username, &hash).await?;
     }
-    let configured = state.db.admin_count().await?;
+    let configured = db.admin_count().await?;
     anyhow::ensure!(
         configured == 1,
         "administrator is not configured; set ADMIN_PASSWORD for bootstrap"

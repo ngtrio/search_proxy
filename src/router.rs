@@ -1,11 +1,11 @@
 #[derive(Debug, Clone)]
-pub struct Candidate<T> {
-    pub value: T,
-    pub weight: i64,
+struct Candidate<T> {
+    value: T,
+    weight: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct WeightedRandom<T> {
+pub(crate) struct WeightedRandom<T> {
     candidates: Vec<Candidate<T>>,
 }
 
@@ -18,27 +18,12 @@ impl<T> Default for WeightedRandom<T> {
 }
 
 impl<T> WeightedRandom<T> {
-    pub fn next_provider(&self) -> Option<&T> {
-        let total = self.total_weight();
-        if total == 0 {
-            return None;
-        }
-        self.select(rand::random_range(0..total))
-    }
-
-    pub fn next_provider_matching(&self, predicate: impl Fn(&T) -> bool) -> Option<&T> {
+    pub(crate) fn next_provider_matching(&self, predicate: impl Fn(&T) -> bool) -> Option<&T> {
         let total = self.total_weight_matching(&predicate);
         if total == 0 {
             return None;
         }
         self.select_matching(rand::random_range(0..total), predicate)
-    }
-
-    fn total_weight(&self) -> u128 {
-        self.candidates
-            .iter()
-            .map(|candidate| candidate.weight as u128)
-            .sum()
     }
 
     fn total_weight_matching(&self, predicate: &impl Fn(&T) -> bool) -> u128 {
@@ -47,17 +32,6 @@ impl<T> WeightedRandom<T> {
             .filter(|candidate| predicate(&candidate.value))
             .map(|candidate| candidate.weight as u128)
             .sum()
-    }
-
-    fn select(&self, mut ticket: u128) -> Option<&T> {
-        for candidate in &self.candidates {
-            let weight = candidate.weight as u128;
-            if ticket < weight {
-                return Some(&candidate.value);
-            }
-            ticket -= weight;
-        }
-        None
     }
 
     fn select_matching(&self, mut ticket: u128, predicate: impl Fn(&T) -> bool) -> Option<&T> {
@@ -74,14 +48,19 @@ impl<T> WeightedRandom<T> {
         None
     }
 
-    pub fn find(&self, predicate: impl Fn(&T) -> bool) -> Option<&T> {
+    pub(crate) fn find(&self, predicate: impl Fn(&T) -> bool) -> Option<&T> {
         self.candidates
             .iter()
             .find(|candidate| predicate(&candidate.value))
             .map(|candidate| &candidate.value)
     }
 
-    pub fn upsert(&mut self, value: T, weight: i64, matches: impl Fn(&T) -> bool) -> Option<T> {
+    pub(crate) fn upsert(
+        &mut self,
+        value: T,
+        weight: i64,
+        matches: impl Fn(&T) -> bool,
+    ) -> Option<T> {
         let previous = self.remove(matches);
         if weight > 0 {
             self.candidates.push(Candidate { value, weight });
@@ -89,7 +68,7 @@ impl<T> WeightedRandom<T> {
         previous
     }
 
-    pub fn remove(&mut self, predicate: impl Fn(&T) -> bool) -> Option<T> {
+    pub(crate) fn remove(&mut self, predicate: impl Fn(&T) -> bool) -> Option<T> {
         let index = self
             .candidates
             .iter()
@@ -97,7 +76,7 @@ impl<T> WeightedRandom<T> {
         Some(self.candidates.remove(index).value)
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
 }
@@ -105,18 +84,6 @@ impl<T> WeightedRandom<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn partitions_random_range_by_weight() {
-        let mut router = WeightedRandom::default();
-        router.upsert(1, 1, |_| false);
-        router.upsert(2, 2, |_| false);
-        let selected: Vec<_> = (0..3)
-            .map(|ticket| *router.select(ticket).unwrap())
-            .collect();
-        assert_eq!(selected.iter().filter(|id| **id == 1).count(), 1);
-        assert_eq!(selected.iter().filter(|id| **id == 2).count(), 2);
-    }
-
     #[test]
     fn upserts_and_removes_one_candidate() {
         let mut router = WeightedRandom::default();
