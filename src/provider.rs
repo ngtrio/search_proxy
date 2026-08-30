@@ -1,10 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
@@ -12,8 +9,8 @@ use rmcp::service::RunningService;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ClientInfo, ContentBlock,
-        PaginatedRequestParams, ProtocolVersion, Tool,
+        CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, PaginatedRequestParams,
+        ProtocolVersion, Tool,
     },
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -24,6 +21,7 @@ use serde_json::{Map, Value};
 use crate::{
     catalog::canonical_tools,
     db::{Database, NewProvider, ProviderConfig, ProviderUpdate, RequestRecord},
+    mcp::SUPPORTED_PROTOCOL_VERSIONS,
     router::WeightedRandom,
 };
 
@@ -37,24 +35,15 @@ pub enum ToolCallError {
 pub enum ProviderError {
     #[error("no connected provider currently supports {0}")]
     Unavailable(String),
-    #[error("provider rate limited the request")]
-    RateLimited,
-    #[error("provider session expired")]
-    SessionExpired,
     #[error("provider request failed")]
-    Transport,
-    #[error("provider returned an error")]
-    Upstream,
+    Failed(#[source] anyhow::Error),
 }
 
 impl ProviderError {
     pub fn category(&self) -> &'static str {
         match self {
             Self::Unavailable(_) => "unavailable",
-            Self::RateLimited => "rate_limited",
-            Self::SessionExpired => "session_expired",
-            Self::Transport => "transport",
-            Self::Upstream => "upstream",
+            Self::Failed(_) => "provider_error",
         }
     }
 }
@@ -102,7 +91,6 @@ struct ConnectedProvider {
     kind: String,
     endpoint: String,
     bearer_token: String,
-    reconnect_required: AtomicBool,
     upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
 }
@@ -110,7 +98,6 @@ struct ConnectedProvider {
 pub struct ProviderManager {
     db: Database,
     router: RwLock<WeightedRandom<Arc<ConnectedProvider>>>,
-    reconnect_lock: tokio::sync::Mutex<()>,
 }
 
 impl ProviderManager {
@@ -118,7 +105,6 @@ impl ProviderManager {
         let registry = Self {
             db: db.clone(),
             router: RwLock::new(WeightedRandom::default()),
-            reconnect_lock: tokio::sync::Mutex::new(()),
         };
         for provider in db.providers().await? {
             let description = format!("{} ({})", provider.name, provider.id);
@@ -206,10 +192,9 @@ impl ProviderManager {
             desired.weight,
         )?;
         let live = self.find(id);
-        let can_reuse = live.as_ref().is_some_and(|provider| {
-            provider.has_same_connection(&desired)
-                && !provider.reconnect_required.load(Ordering::Acquire)
-        });
+        let can_reuse = live
+            .as_ref()
+            .is_some_and(|provider| provider.has_same_connection(&desired));
         let prepared = if desired.enabled && !can_reuse {
             Some(
                 connect_config(&desired, canonical_tools())
@@ -285,14 +270,6 @@ impl ProviderManager {
             .remove(|provider| provider.id == id);
     }
 
-    pub fn has_providers(&self) -> bool {
-        !self
-            .router
-            .read()
-            .expect("provider router poisoned")
-            .is_empty()
-    }
-
     pub fn tools(&self) -> &[Tool] {
         canonical_tools()
     }
@@ -348,11 +325,7 @@ impl ProviderManager {
         tool_name: &str,
         arguments: Map<String, Value>,
     ) -> Result<(i64, CallToolResult), ProviderFailure> {
-        let mut provider = self.select(tool_name)?;
-        if provider.reconnect_required.load(Ordering::Acquire) {
-            self.reconnect(provider.id).await?;
-            provider = self.select(tool_name)?;
-        }
+        let provider = self.select(tool_name)?;
         let id = provider.id;
         let upstream_name = provider
             .upstream_tools
@@ -360,25 +333,18 @@ impl ProviderManager {
             .expect("selected provider supports requested tool")
             .clone();
         let params = CallToolRequestParams::new(upstream_name).with_arguments(arguments);
-        match provider.client.call_tool_once(params).await {
-            Ok(CallToolResponse::Complete(result)) => Ok((id, result)),
-            Ok(_) => Err(ProviderFailure::after_routing(id, ProviderError::Upstream)),
+        match provider.client.call_tool(params).await {
+            Ok(result) => Ok((id, result)),
             Err(error) => {
-                let text = error.to_string().to_ascii_lowercase();
-                let returned = if text.contains("session expired") {
-                    ProviderError::SessionExpired
-                } else if text.contains("429") || text.contains("rate limit") {
-                    ProviderError::RateLimited
-                } else {
-                    ProviderError::Transport
-                };
-                if matches!(
-                    returned,
-                    ProviderError::SessionExpired | ProviderError::Transport
-                ) {
-                    provider.reconnect_required.store(true, Ordering::Release);
-                }
-                Err(ProviderFailure::after_routing(id, returned))
+                tracing::warn!(
+                    provider_id = id,
+                    error = %error,
+                    "provider tool call failed"
+                );
+                Err(ProviderFailure::after_routing(
+                    id,
+                    ProviderError::Failed(anyhow::Error::new(error)),
+                ))
             }
         }
     }
@@ -444,30 +410,6 @@ impl ProviderManager {
             .expect("provider router poisoned")
             .upsert(Arc::new(provider), weight, |provider| provider.id == id);
     }
-
-    async fn reconnect(&self, id: i64) -> Result<(), ProviderFailure> {
-        let _guard = self.reconnect_lock.lock().await;
-        if self
-            .find(id)
-            .is_some_and(|provider| !provider.reconnect_required.load(Ordering::Acquire))
-        {
-            return Ok(());
-        }
-        let config = self
-            .db
-            .provider(id)
-            .await
-            .map_err(|_| ProviderFailure::after_routing(id, ProviderError::Transport))?
-            .filter(|provider| provider.enabled)
-            .ok_or_else(|| {
-                ProviderFailure::after_routing(id, ProviderError::Unavailable(id.to_string()))
-            })?;
-        let (client, upstream_tools) = connect_config(&config, canonical_tools())
-            .await
-            .map_err(|_| ProviderFailure::after_routing(id, ProviderError::Transport))?;
-        self.install(ConnectedProvider::new(config, client, upstream_tools));
-        Ok(())
-    }
 }
 
 fn validate_provider(
@@ -515,7 +457,6 @@ impl ConnectedProvider {
             kind: provider.kind,
             endpoint: provider.endpoint,
             bearer_token: provider.bearer_token,
-            reconnect_required: AtomicBool::new(false),
             upstream_tools,
             client,
         }
@@ -533,7 +474,6 @@ impl ConnectedProvider {
             kind: provider.kind,
             endpoint: provider.endpoint,
             bearer_token: provider.bearer_token,
-            reconnect_required: AtomicBool::new(false),
             upstream_tools,
             client,
         }
@@ -573,15 +513,13 @@ async fn connect(
 )> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(endpoint.to_owned())
-            .auth_header(bearer_token.to_owned())
-            // An in-flight tool call must never be replayed after session recovery.
-            .reinit_on_expired_session(false),
+            .auth_header(bearer_token.to_owned()),
     );
     let mut client = ClientInfo::default()
         .serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Auto {
-                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                preferred_versions: SUPPORTED_PROTOCOL_VERSIONS.iter().rev().cloned().collect(),
                 legacy_version: Some(ProtocolVersion::V_2025_11_25),
             },
         )
@@ -641,6 +579,7 @@ fn mapped_name_candidates<'a>(kind: &str, canonical_name: &'a str) -> Vec<Cow<'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn provider_name_candidates_cover_every_canonical_tool() {
         for tool in canonical_tools() {
@@ -653,5 +592,17 @@ mod tests {
                 [tool.name.to_string()]
             );
         }
+    }
+
+    #[test]
+    fn provider_error_keeps_sdk_source_but_exposes_one_category() {
+        let error = ProviderError::Failed(anyhow::Error::msg("sdk detail"));
+
+        assert_eq!(error.category(), "provider_error");
+        assert_eq!(error.to_string(), "provider request failed");
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "sdk detail"
+        );
     }
 }

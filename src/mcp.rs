@@ -29,7 +29,7 @@ struct GatewayHandler {
 #[derive(Clone, Copy)]
 struct AuthenticatedClient(i64);
 
-const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
     ProtocolVersion::V_2025_11_25,
@@ -110,7 +110,7 @@ async fn authenticate(
         .headers()
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(extract_bearer_token);
     let Some(secret) = secret else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -124,6 +124,13 @@ async fn authenticate(
     };
     request.extensions_mut().insert(AuthenticatedClient(id));
     next.run(request).await
+}
+
+fn extract_bearer_token(value: &str) -> Option<&str> {
+    let mut parts = value.split_ascii_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    (parts.next().is_none() && scheme.eq_ignore_ascii_case("bearer")).then_some(token)
 }
 
 #[cfg(test)]
@@ -158,5 +165,15 @@ mod tests {
                 ProtocolVersion::V_2026_07_28,
             ]
         );
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        assert_eq!(extract_bearer_token("Bearer secret"), Some("secret"));
+        assert_eq!(extract_bearer_token("bearer secret"), Some("secret"));
+        assert_eq!(extract_bearer_token("BEARER secret"), Some("secret"));
+        assert_eq!(extract_bearer_token("Basic secret"), None);
+        assert_eq!(extract_bearer_token("Bearer"), None);
+        assert_eq!(extract_bearer_token("Bearer secret extra"), None);
     }
 }

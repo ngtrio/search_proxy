@@ -119,9 +119,11 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> impl 
         tracing::error!(%error, "could not create admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let cookie =
-        format!("gateway_session={token}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=28800");
-    let csrf_cookie = format!("gateway_csrf={csrf}; Path=/admin; SameSite=Strict; Max-Age=28800");
+    let cookie = format!(
+        "gateway_session={token}; Path=/admin; HttpOnly; SameSite=Strict; Secure; Max-Age=28800"
+    );
+    let csrf_cookie =
+        format!("gateway_csrf={csrf}; Path=/admin; SameSite=Strict; Secure; Max-Age=28800");
     let mut response = (
         StatusCode::OK,
         Json(json!({"csrf_token":csrf,"expires_at":expires})),
@@ -149,13 +151,13 @@ async fn logout(AdminWrite(id): AdminWrite, State(state): State<AppState>) -> im
     let mut response = (StatusCode::NO_CONTENT,).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
-        "gateway_session=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0"
+        "gateway_session=; Path=/admin; HttpOnly; SameSite=Strict; Secure; Max-Age=0"
             .parse()
             .expect("valid cookie"),
     );
     response.headers_mut().append(
         header::SET_COOKIE,
-        "gateway_csrf=; Path=/admin; SameSite=Strict; Max-Age=0"
+        "gateway_csrf=; Path=/admin; SameSite=Strict; Secure; Max-Age=0"
             .parse()
             .expect("valid cookie"),
     );

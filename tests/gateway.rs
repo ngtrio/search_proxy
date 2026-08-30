@@ -365,7 +365,11 @@ async fn admin_csrf_write_only_tokens() {
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
-        .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_owned())
+        .map(|v| {
+            let value = v.to_str().unwrap();
+            assert!(value.contains("; Secure"));
+            value.split(';').next().unwrap().to_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(cookies.len(), 2);
     let cookie = cookies.join("; ");
@@ -447,16 +451,10 @@ async fn provider_schema_has_no_probe_or_cooldown_state() {
     .await
     .unwrap();
     assert_eq!(probe_tables, 0);
-    let cooldown_settings: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key='default_cooldown_seconds'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(cooldown_settings, 0);
 }
 
 #[tokio::test]
-async fn settings_have_no_removed_maintenance_controls() {
+async fn settings_table_is_removed() {
     let (_state, dir) = state().await;
     let pool = SqlitePool::connect(&format!(
         "sqlite://{}?mode=rwc",
@@ -464,13 +462,13 @@ async fn settings_have_no_removed_maintenance_controls() {
     ))
     .await
     .unwrap();
-    let removed_settings: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM settings WHERE key IN ('retention_days','default_cooldown_seconds','default_timeout_seconds')",
+    let settings_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(removed_settings, 0);
+    assert_eq!(settings_table, 0);
 }
 
 #[tokio::test]
@@ -758,7 +756,11 @@ async fn failed_provider_connections_do_not_poison_persistence_or_startup() {
     let loaded = ProviderManager::new(state.db.clone())
         .await
         .expect("an unavailable provider must not prevent the control plane from starting");
-    assert!(!loaded.has_providers());
+    let failure = loaded
+        .call("tavily_search", serde_json::Map::new())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.provider_id, None);
 }
 
 #[tokio::test]
@@ -838,7 +840,14 @@ async fn enabled_provider_creation_connects_before_activation() {
     assert_eq!(created.status(), StatusCode::CREATED);
     let created = body_json(created).await;
     assert!(created["id"].is_number());
-    assert!(state.providers.has_providers());
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("provider_specific".into(), json!(true));
+    let (_, result) = state
+        .providers
+        .call("tavily_search", arguments)
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
     let unsupported = state
         .providers
         .call("tavily_extract", serde_json::Map::new())
@@ -847,7 +856,7 @@ async fn enabled_provider_creation_connects_before_activation() {
     assert_eq!(unsupported.provider_id, None);
     assert_eq!(
         mock.calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
+        1,
         "a provider that did not advertise a tool must not receive that call"
     );
     task.abort();

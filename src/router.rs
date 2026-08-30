@@ -75,10 +75,6 @@ impl<T> WeightedRandom<T> {
             .position(|candidate| predicate(&candidate.value))?;
         Some(self.candidates.remove(index).value)
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.candidates.is_empty()
-    }
 }
 
 #[cfg(test)]
