@@ -17,8 +17,13 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 use tavily_mcp_gateway::{
-    AppState, admin, app, auth::digest, catalog::canonical_tools, config::Config, db::Database,
+    AppState, admin, app,
+    auth::digest,
+    catalog::canonical_tools,
+    config::Config,
+    db::{Database, NewProvider},
     provider::ProviderRegistry,
 };
 use tower::ServiceExt;
@@ -164,9 +169,9 @@ async fn body_sse_json(response: axum::response::Response) -> Value {
 async fn mcp_requires_auth_and_negotiates_all_legacy_revisions() {
     let (state, _dir) = state().await;
     let secret = "tmg_test-secret";
-    sqlx::query("INSERT INTO client_api_keys(name,prefix,digest) VALUES('test','tmg_test',?)")
-        .bind(digest(secret))
-        .execute(&state.db.0)
+    state
+        .db
+        .create_client_key("test", "tmg_test", &digest(secret))
         .await
         .unwrap();
     let gateway = app(state);
@@ -223,13 +228,11 @@ async fn mcp_requires_auth_and_negotiates_all_legacy_revisions() {
 async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
     let (state, _dir) = state().await;
     let secret = "tmg_catalog";
-    sqlx::query(
-        "INSERT INTO client_api_keys(name,prefix,digest) VALUES('catalog','tmg_catalog',?)",
-    )
-    .bind(digest(secret))
-    .execute(&state.db.0)
-    .await
-    .unwrap();
+    state
+        .db
+        .create_client_key("catalog", "tmg_catalog", &digest(secret))
+        .await
+        .unwrap();
     let gateway = app(state);
     let authorization = format!("Bearer {secret}");
     let initialized = gateway
@@ -328,9 +331,9 @@ async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
 async fn modern_discovery_is_stateless() {
     let (state, _dir) = state().await;
     let secret = "tmg_modern";
-    sqlx::query("INSERT INTO client_api_keys(name,prefix,digest) VALUES('modern','tmg_modern',?)")
-        .bind(digest(secret))
-        .execute(&state.db.0)
+    state
+        .db
+        .create_client_key("modern", "tmg_modern", &digest(secret))
         .await
         .unwrap();
     let body = json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}).to_string();
@@ -454,9 +457,12 @@ async fn admin_csrf_write_only_tokens_and_login_throttle() {
 #[tokio::test]
 async fn provider_schema_has_no_probe_or_cooldown_state() {
     let (state, _dir) = state().await;
+    let pool = SqlitePool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let provider_columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('providers')")
-            .fetch_all(&state.db.0)
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(
@@ -467,13 +473,13 @@ async fn provider_schema_has_no_probe_or_cooldown_state() {
     let probe_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='provider_probe_results'",
     )
-    .fetch_one(&state.db.0)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(probe_tables, 0);
     let cooldown_settings: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key='default_cooldown_seconds'")
-            .fetch_one(&state.db.0)
+            .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(cooldown_settings, 0);
@@ -482,10 +488,13 @@ async fn provider_schema_has_no_probe_or_cooldown_state() {
 #[tokio::test]
 async fn settings_have_no_removed_maintenance_controls() {
     let (state, _dir) = state().await;
+    let pool = SqlitePool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let removed_settings: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM settings WHERE key IN ('retention_days','default_cooldown_seconds')",
     )
-    .fetch_one(&state.db.0)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(removed_settings, 0);
@@ -494,10 +503,13 @@ async fn settings_have_no_removed_maintenance_controls() {
 #[tokio::test]
 async fn tool_calls_write_metadata_and_daily_aggregates_only() {
     let (state, _dir) = state().await;
+    let pool = SqlitePool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let secret = "tmg_usage";
-    sqlx::query("INSERT INTO client_api_keys(name,prefix,digest) VALUES('usage','tmg_usage',?)")
-        .bind(digest(secret))
-        .execute(&state.db.0)
+    state
+        .db
+        .create_client_key("usage", "tmg_usage", &digest(secret))
         .await
         .unwrap();
     let gateway = app(state.clone());
@@ -601,22 +613,22 @@ async fn tool_calls_write_metadata_and_daily_aggregates_only() {
         "unexpected MCP response: {second_body}"
     );
     let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events")
-        .fetch_one(&state.db.0)
+        .fetch_one(&pool)
         .await
         .unwrap();
     let aggregates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily")
-        .fetch_one(&state.db.0)
+        .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!((events, aggregates), (2, 1));
     let aggregate_requests: i64 = sqlx::query_scalar("SELECT requests FROM usage_daily")
-        .fetch_one(&state.db.0)
+        .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(aggregate_requests, 2);
     let calls: i64 =
         sqlx::query_scalar("SELECT request_count FROM client_api_keys WHERE name='usage'")
-            .fetch_one(&state.db.0)
+            .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(
@@ -625,7 +637,7 @@ async fn tool_calls_write_metadata_and_daily_aggregates_only() {
     );
     let columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('request_events')")
-            .fetch_all(&state.db.0)
+            .fetch_all(&pool)
             .await
             .unwrap();
     assert!(
@@ -658,7 +670,19 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
     });
     let (state, _dir) = state().await;
     let endpoint = format!("http://{address}/mcp");
-    let provider_id=sqlx::query("INSERT INTO providers(kind,name,endpoint,bearer_token,weight,enabled,timeout_seconds) VALUES('searchix','mock',?,'test',1,1,5)").bind(endpoint).execute(&state.db.0).await.unwrap().last_insert_rowid();
+    let provider_id = state
+        .db
+        .create_provider(NewProvider {
+            kind: "searchix".into(),
+            name: "mock".into(),
+            endpoint,
+            bearer_token: "test".into(),
+            weight: 1,
+            enabled: true,
+            timeout_seconds: 5,
+        })
+        .await
+        .unwrap();
     let provider = state.db.provider(provider_id).await.unwrap().unwrap();
     state.providers.add(provider).await.unwrap();
     for tool in canonical_tools() {

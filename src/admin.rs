@@ -7,14 +7,13 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sqlx::FromRow;
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     AppState,
     auth::{digest, hash_password, random_secret, verify_digest, verify_password},
-    db::ClientKeyRow,
+    db::{GatewaySettings, NewProvider, ProviderUpdate},
 };
 
 pub fn routes() -> Router<AppState> {
@@ -32,10 +31,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
-        .fetch_one(&state.db.0)
-        .await
-        .is_ok();
+    let db_ok = state.db.health_check().await.is_ok();
     let ready = db_ok && state.providers.has_providers();
     (
         if ready {
@@ -87,15 +83,13 @@ async fn login(
     if !same_origin(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let locked: bool = sqlx::query_scalar(
-        "SELECT locked_until > CURRENT_TIMESTAMP FROM admin_login_throttle WHERE identity=?",
-    )
-    .bind(&input.username)
-    .fetch_optional(&state.db.0)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(false);
+    let locked = match state.db.admin_login_is_locked(&input.username).await {
+        Ok(locked) => locked,
+        Err(error) => {
+            tracing::error!(%error, "could not read admin login throttle");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     if locked {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -103,42 +97,42 @@ async fn login(
         )
             .into_response();
     }
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT username,password_hash FROM admins WHERE id=1")
-            .fetch_optional(&state.db.0)
-            .await
-            .ok()
-            .flatten();
-    if !row.is_some_and(|(username, hash)| {
-        username == input.username && verify_password(&input.password, &hash)
-    }) {
-        let _ = sqlx::query("INSERT INTO admin_login_throttle(identity,failed_attempts) VALUES(?,1) ON CONFLICT(identity) DO UPDATE SET failed_attempts=CASE WHEN window_started_at < datetime('now','-10 minutes') THEN 1 ELSE failed_attempts+1 END,window_started_at=CASE WHEN window_started_at < datetime('now','-10 minutes') THEN CURRENT_TIMESTAMP ELSE window_started_at END,locked_until=CASE WHEN (CASE WHEN window_started_at < datetime('now','-10 minutes') THEN 1 ELSE failed_attempts+1 END)>=5 THEN datetime('now','+5 minutes') ELSE locked_until END")
-            .bind(&input.username).execute(&state.db.0).await;
+    let credentials = match state.db.admin_credentials().await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::error!(%error, "could not read administrator credentials");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let authenticated = credentials.as_ref().is_some_and(|credentials| {
+        credentials.username == input.username
+            && verify_password(&input.password, &credentials.password_hash)
+    });
+    if !authenticated {
+        if let Err(error) = state.db.record_admin_login_failure(&input.username).await {
+            tracing::warn!(%error, "could not record admin login failure");
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid credentials"})),
         )
             .into_response();
     }
-    let _ = sqlx::query("DELETE FROM admin_login_throttle WHERE identity=?")
-        .bind(&input.username)
-        .execute(&state.db.0)
-        .await;
+    if let Err(error) = state.db.clear_admin_login_failures(&input.username).await {
+        tracing::warn!(%error, "could not clear admin login throttle");
+    }
     let token = random_secret(32);
     let csrf = random_secret(32);
     let id = random_secret(16);
     let expires = Utc::now() + Duration::hours(8);
-    if sqlx::query(
-        "INSERT INTO admin_sessions(id,token_digest,csrf_digest,expires_at) VALUES(?,?,?,?)",
-    )
-    .bind(id)
-    .bind(digest(&token))
-    .bind(digest(&csrf))
-    .bind(expires)
-    .execute(&state.db.0)
-    .await
-    .is_err()
+    let token_digest = digest(&token);
+    let csrf_digest = digest(&csrf);
+    if let Err(error) = state
+        .db
+        .create_admin_session(&id, &token_digest, &csrf_digest, expires)
+        .await
     {
+        tracing::error!(%error, "could not create admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let secure = if state.config.production {
@@ -180,10 +174,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     let Some(id) = admin_auth(&state, &headers, true).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let _ = sqlx::query("DELETE FROM admin_sessions WHERE id=?")
-        .bind(id)
-        .execute(&state.db.0)
-        .await;
+    if let Err(error) = state.db.delete_admin_session(&id).await {
+        tracing::error!(%error, "could not delete admin session");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let mut response = (StatusCode::NO_CONTENT,).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -209,17 +203,21 @@ async fn admin_auth(state: &AppState, headers: &HeaderMap, write: bool) -> Optio
         .split(';')
         .map(str::trim)
         .find_map(|p| p.strip_prefix("gateway_session="))?;
-    let rows: Vec<(String,Vec<u8>,Vec<u8>)> = sqlx::query_as("SELECT id,token_digest,csrf_digest FROM admin_sessions WHERE expires_at > CURRENT_TIMESTAMP").fetch_all(&state.db.0).await.ok()?;
-    let (id, _, csrf) = rows
-        .into_iter()
-        .find(|(_, expected, _)| verify_digest(token, expected))?;
+    let session = match state.db.admin_session(&digest(token)).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::error!(%error, "could not authenticate admin session");
+            return None;
+        }
+    };
     if write {
         let supplied = headers.get("x-csrf-token")?.to_str().ok()?;
-        if !verify_digest(supplied, &csrf) {
+        if !verify_digest(supplied, &session.csrf_digest) {
             return None;
         }
     }
-    Some(id)
+    Some(session.id)
 }
 
 fn same_origin(state: &AppState, headers: &HeaderMap) -> bool {
@@ -233,8 +231,13 @@ async fn keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRes
     if admin_auth(&state, &headers, false).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let rows = sqlx::query_as::<_,ClientKeyRow>("SELECT id,name,prefix,status,created_at,last_used_at,request_count FROM client_api_keys ORDER BY id DESC").fetch_all(&state.db.0).await.unwrap_or_default();
-    Json(rows).into_response()
+    match state.db.client_key_summaries().await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not list client API keys");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 #[derive(Deserialize)]
 struct Name {
@@ -253,19 +256,20 @@ async fn create_key(
     }
     let secret = format!("tmg_{}", random_secret(32));
     let prefix = secret.chars().take(12).collect::<String>();
-    match sqlx::query("INSERT INTO client_api_keys(name,prefix,digest) VALUES(?,?,?)")
-        .bind(input.name)
-        .bind(&prefix)
-        .bind(digest(&secret))
-        .execute(&state.db.0)
+    match state
+        .db
+        .create_client_key(&input.name, &prefix, &digest(&secret))
         .await
     {
-        Ok(result) => (
+        Ok(id) => (
             StatusCode::CREATED,
-            Json(json!({"id":result.last_insert_rowid(),"prefix":prefix,"key":secret})),
+            Json(json!({"id":id,"prefix":prefix,"key":secret})),
         )
             .into_response(),
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "could not create client API key");
+            StatusCode::BAD_REQUEST.into_response()
+        }
     }
 }
 async fn revoke_key(
@@ -276,20 +280,25 @@ async fn revoke_key(
     if admin_auth(&state, &headers, true).await.is_none() {
         return StatusCode::UNAUTHORIZED;
     }
-    let _ = sqlx::query("UPDATE client_api_keys SET status='revoked' WHERE id=?")
-        .bind(id)
-        .execute(&state.db.0)
-        .await;
-    StatusCode::NO_CONTENT
+    match state.db.revoke_client_key(id).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) => {
+            tracing::error!(%error, "could not revoke client API key");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 async fn providers(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if admin_auth(&state, &headers, false).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.db.providers().await {
+    match state.db.provider_summaries().await {
         Ok(rows) => Json(rows).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not list providers");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 #[derive(Deserialize)]
@@ -310,25 +319,47 @@ async fn create_provider(
     if admin_auth(&state, &headers, true).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if !valid_provider(&input) || input.token.as_deref().is_none_or(str::is_empty) {
+    if !valid_provider(&input) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let result = sqlx::query("INSERT INTO providers(kind,name,endpoint,bearer_token,weight,enabled,timeout_seconds) VALUES(?,?,?,?,?,?,?)")
-        .bind(input.kind).bind(input.name).bind(input.endpoint).bind(input.token.unwrap()).bind(input.weight).bind(input.enabled).bind(input.timeout_seconds).execute(&state.db.0).await;
-    match result {
-        Ok(r) => {
-            let id = r.last_insert_rowid();
-            let provider = match state.db.provider(id).await {
-                Ok(Some(provider)) => provider,
-                _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            if state.providers.add(provider).await.is_err() {
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
-            (StatusCode::CREATED, Json(json!({"id":id}))).into_response()
+    let Some(token) = input.token.filter(|token| !token.is_empty()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let id = match state
+        .db
+        .create_provider(NewProvider {
+            kind: input.kind,
+            name: input.name,
+            endpoint: input.endpoint,
+            bearer_token: token,
+            weight: input.weight,
+            enabled: input.enabled,
+            timeout_seconds: input.timeout_seconds,
+        })
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "could not create provider");
+            return StatusCode::BAD_REQUEST.into_response();
         }
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    };
+    let provider = match state.db.provider(id).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => {
+            tracing::error!(provider_id = id, "created provider could not be reloaded");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, provider_id = id, "could not reload created provider");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Err(error) = state.providers.add(provider).await {
+        tracing::warn!(%error, provider_id = id, "could not activate created provider");
+        return StatusCode::BAD_GATEWAY.into_response();
     }
+    (StatusCode::CREATED, Json(json!({"id":id}))).into_response()
 }
 async fn update_provider(
     State(state): State<AppState>,
@@ -342,16 +373,41 @@ async fn update_provider(
     if !valid_provider(&input) {
         return StatusCode::BAD_REQUEST;
     }
-    let updated = sqlx::query("UPDATE providers SET kind=?,name=?,endpoint=?,bearer_token=COALESCE(NULLIF(?,''),bearer_token),weight=?,enabled=?,timeout_seconds=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-        .bind(input.kind).bind(input.name).bind(input.endpoint).bind(input.token).bind(input.weight).bind(input.enabled).bind(input.timeout_seconds).bind(id).execute(&state.db.0).await;
-    if updated.is_err() || updated.is_ok_and(|result| result.rows_affected() == 0) {
+    let updated = match state
+        .db
+        .update_provider(
+            id,
+            ProviderUpdate {
+                kind: input.kind,
+                name: input.name,
+                endpoint: input.endpoint,
+                bearer_token: input.token,
+                weight: input.weight,
+                enabled: input.enabled,
+                timeout_seconds: input.timeout_seconds,
+            },
+        )
+        .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::error!(%error, provider_id = id, "could not update provider");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    if !updated {
         return StatusCode::NOT_FOUND;
     }
     let provider = match state.db.provider(id).await {
         Ok(Some(provider)) => provider,
-        _ => return StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(error) => {
+            tracing::error!(%error, provider_id = id, "could not reload updated provider");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
     };
-    if state.providers.update(provider).await.is_err() {
+    if let Err(error) = state.providers.update(provider).await {
+        tracing::warn!(%error, provider_id = id, "could not apply provider update");
         return StatusCode::BAD_GATEWAY;
     }
     StatusCode::NO_CONTENT
@@ -371,61 +427,37 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> impl Int
     if admin_auth(&state, &headers, false).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    #[derive(FromRow, Serialize)]
-    struct ProviderMetric {
-        provider: String,
-        requests: i64,
-        successes: i64,
-        failures: i64,
-        average_latency_ms: i64,
+    match state.db.usage_overview().await {
+        Ok(overview) => Json(overview).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not load usage overview");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    #[derive(FromRow, Serialize)]
-    struct DailyMetric {
-        day: String,
-        requests: i64,
-        successes: i64,
-        failures: i64,
-        average_latency_ms: i64,
-    }
-    let row: (i64,i64,i64)=sqlx::query_as("SELECT COUNT(*),COALESCE(SUM(outcome='success'),0),COALESCE(AVG(duration_ms),0) FROM request_events WHERE started_at >= datetime('now','-30 days')").fetch_one(&state.db.0).await.unwrap_or((0,0,0));
-    let providers: Vec<ProviderMetric> = sqlx::query_as("SELECT p.name provider,COUNT(*) requests,COALESCE(SUM(e.outcome='success'),0) successes,COALESCE(SUM(e.outcome<>'success'),0) failures,COALESCE(AVG(e.duration_ms),0) average_latency_ms FROM request_events e JOIN providers p ON p.id=e.provider_id WHERE e.started_at >= datetime('now','-30 days') GROUP BY p.id,p.name ORDER BY p.name")
-        .fetch_all(&state.db.0).await.unwrap_or_default();
-    let daily: Vec<DailyMetric> = sqlx::query_as("SELECT day,SUM(requests) requests,COALESCE(SUM(CASE WHEN outcome='success' THEN requests ELSE 0 END),0) successes,COALESCE(SUM(CASE WHEN outcome<>'success' THEN requests ELSE 0 END),0) failures,CASE WHEN SUM(requests)>0 THEN SUM(duration_ms)/SUM(requests) ELSE 0 END average_latency_ms FROM usage_daily WHERE day >= date('now','-30 days') GROUP BY day ORDER BY day")
-        .fetch_all(&state.db.0).await.unwrap_or_default();
-    Json(json!({"requests":row.0,"successes":row.1,"failures":row.0-row.1,"average_latency_ms":row.2,"providers":providers,"daily":daily})).into_response()
 }
 async fn requests(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if admin_auth(&state, &headers, false).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    #[derive(FromRow)]
-    struct RequestRow {
-        id: String,
-        prefix: Option<String>,
-        client_key_name: Option<String>,
-        provider: Option<String>,
-        started_at: String,
-        duration_ms: i64,
-        outcome: String,
-        error_category: Option<String>,
+    match state.db.recent_requests().await {
+        Ok(requests) => Json(requests).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not load recent requests");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    let rows: Vec<RequestRow> = sqlx::query_as("SELECT e.id,k.prefix,k.name client_key_name,p.name provider,e.started_at,e.duration_ms,e.outcome,e.error_category FROM request_events e LEFT JOIN client_api_keys k ON k.id=e.client_key_id LEFT JOIN providers p ON p.id=e.provider_id ORDER BY e.started_at DESC LIMIT 200").fetch_all(&state.db.0).await.unwrap_or_default();
-    Json(rows.into_iter().map(|r|json!({"request_id":r.id,"client_key_prefix":r.prefix,"client_key_name":r.client_key_name,"provider":r.provider,"started_at":r.started_at,"duration_ms":r.duration_ms,"outcome":r.outcome,"error_category":r.error_category})).collect::<Vec<Value>>()).into_response()
 }
 async fn settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if admin_auth(&state, &headers, false).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT key,value FROM settings")
-        .fetch_all(&state.db.0)
-        .await
-        .unwrap_or_default();
-    let values = rows
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
-    Json(json!({
-        "default_timeout_seconds":values.get("default_timeout_seconds").and_then(|v|v.parse::<i64>().ok()).unwrap_or(120)
-    })).into_response()
+    match state.db.settings().await {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not load gateway settings");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -443,28 +475,30 @@ async fn update_settings(
     if input.default_timeout_seconds <= 0 {
         return StatusCode::BAD_REQUEST;
     }
-    let mut tx = match state.db.0.begin().await {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    for (key, value) in [("default_timeout_seconds", input.default_timeout_seconds)] {
-        if sqlx::query("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key).bind(value.to_string()).execute(&mut *tx).await.is_err() { return StatusCode::INTERNAL_SERVER_ERROR; }
-    }
-    if tx.commit().await.is_err() {
-        StatusCode::INTERNAL_SERVER_ERROR
-    } else {
-        StatusCode::NO_CONTENT
+    match state
+        .db
+        .update_settings(&GatewaySettings {
+            default_timeout_seconds: input.default_timeout_seconds,
+        })
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) => {
+            tracing::error!(%error, "could not update gateway settings");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
 pub async fn bootstrap(state: &AppState) -> anyhow::Result<()> {
     if let Some(password) = &state.config.admin_password {
         let hash = hash_password(password)?;
-        sqlx::query("INSERT INTO admins(id,username,password_hash) VALUES(1,?,?) ON CONFLICT(id) DO NOTHING").bind(&state.config.admin_username).bind(hash).execute(&state.db.0).await?;
+        state
+            .db
+            .insert_admin_if_missing(&state.config.admin_username, &hash)
+            .await?;
     }
-    let configured: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admins")
-        .fetch_one(&state.db.0)
-        .await?;
+    let configured = state.db.admin_count().await?;
     anyhow::ensure!(
         configured == 1,
         "administrator is not configured; set ADMIN_PASSWORD for bootstrap"

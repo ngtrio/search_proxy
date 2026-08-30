@@ -24,7 +24,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     catalog::canonical_tools,
-    db::{Database, ProviderRow},
+    db::{Database, ProviderConfig},
     router::WeightedRandom,
 };
 
@@ -114,7 +114,7 @@ impl ProviderRegistry {
     }
 
     /// Adds one provider to the live router without touching existing connections.
-    pub async fn add(&self, provider: ProviderRow) -> anyhow::Result<()> {
+    pub async fn add(&self, provider: ProviderConfig) -> anyhow::Result<()> {
         if !provider.enabled {
             return Ok(());
         }
@@ -141,7 +141,7 @@ impl ProviderRegistry {
 
     /// Applies one provider's configuration, reconnecting only when connection
     /// parameters changed or when a disabled provider becomes enabled.
-    pub async fn update(&self, provider: ProviderRow) -> anyhow::Result<()> {
+    pub async fn update(&self, provider: ProviderConfig) -> anyhow::Result<()> {
         let previous = self
             .router
             .read()
@@ -241,7 +241,7 @@ impl ProviderRegistry {
 
 impl ConnectedProvider {
     fn new(
-        provider: ProviderRow,
+        provider: ProviderConfig,
         client: RunningService<RoleClient, ClientInfo>,
         upstream_tools: HashMap<String, String>,
     ) -> Self {
@@ -256,7 +256,7 @@ impl ConnectedProvider {
         }
     }
 
-    fn has_same_connection(&self, provider: &ProviderRow) -> bool {
+    fn has_same_connection(&self, provider: &ProviderConfig) -> bool {
         self.kind == provider.kind
             && self.endpoint == provider.endpoint
             && self.bearer_token == provider.bearer_token
@@ -264,7 +264,7 @@ impl ConnectedProvider {
 }
 
 async fn connect(
-    provider: &ProviderRow,
+    provider: &ProviderConfig,
 ) -> anyhow::Result<(
     RunningService<RoleClient, ClientInfo>,
     HashMap<String, String>,

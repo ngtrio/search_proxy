@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::verify_digest,
+    auth::digest,
     catalog::{canonical_tool, canonical_tools},
+    db::RequestRecord,
 };
 
 #[derive(Clone)]
@@ -75,10 +76,9 @@ impl ServerHandler for GatewayHandler {
         let request_id = Uuid::new_v4().to_string();
         let started = Instant::now();
         let arguments = request.arguments.unwrap_or_default();
-        let _ = sqlx::query("UPDATE client_api_keys SET last_used_at=CURRENT_TIMESTAMP,request_count=request_count+1 WHERE id=?")
-            .bind(client_key_id)
-            .execute(&self.state.db.0)
-            .await;
+        if let Err(error) = self.state.db.mark_client_key_used(client_key_id).await {
+            tracing::warn!(%error, client_key_id, "could not update client API key usage");
+        }
         match self
             .state
             .providers
@@ -148,16 +148,13 @@ async fn authenticate(
     let Some(secret) = secret else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let rows: Vec<(i64, Vec<u8>)> =
-        sqlx::query_as("SELECT id,digest FROM client_api_keys WHERE status='active'")
-            .fetch_all(&state.db.0)
-            .await
-            .unwrap_or_default();
-    let Some(id) = rows
-        .into_iter()
-        .find_map(|(id, expected)| verify_digest(secret, &expected).then_some(id))
-    else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let id = match state.db.active_client_key_id(&digest(secret)).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "could not authenticate client API key");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     if request.method() == axum::http::Method::POST {
         let (parts, body) = request.into_parts();
@@ -215,19 +212,20 @@ async fn record(
         error_category = category,
         "canonical tool call completed"
     );
-    let mut tx = match state.db.0.begin().await {
-        Ok(tx) => tx,
-        Err(_) => return,
-    };
-    if sqlx::query("INSERT INTO request_events(id,client_key_id,provider_id,duration_ms,outcome,error_category) VALUES(?,?,?,?,?,?)")
-        .bind(request_id).bind(client).bind(provider).bind(duration).bind(outcome).bind(category).execute(&mut *tx).await.is_err() { return; }
-    let updated = sqlx::query("UPDATE usage_daily SET requests=requests+1,duration_ms=duration_ms+? WHERE day=date('now') AND client_key_id=? AND provider_id IS ? AND outcome=?")
-        .bind(duration).bind(client).bind(provider).bind(outcome).execute(&mut *tx).await;
-    if updated.is_ok_and(|result| result.rows_affected() == 0) {
-        let _ = sqlx::query("INSERT INTO usage_daily(day,client_key_id,provider_id,outcome,requests,duration_ms) VALUES(date('now'),?,?,?,?,?)")
-            .bind(client).bind(provider).bind(outcome).bind(1_i64).bind(duration).execute(&mut *tx).await;
+    if let Err(error) = state
+        .db
+        .record_request(RequestRecord {
+            id: request_id,
+            client_key_id: client,
+            provider_id: provider,
+            duration_ms: duration,
+            outcome,
+            error_category: category,
+        })
+        .await
+    {
+        tracing::error!(%error, request_id, "could not persist tool call metadata");
     }
-    let _ = tx.commit().await;
 }
 
 #[cfg(test)]
