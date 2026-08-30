@@ -1,17 +1,17 @@
 use axum::{
     Json, Router,
     extract::{FromRequestParts, Path, State},
-    http::{HeaderMap, StatusCode, header, request::Parts},
-    response::IntoResponse,
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::{Duration, Utc};
-use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
-    AppState,
+    AdminConfig, AppState,
     auth::{digest, hash_password, random_secret, verify_digest, verify_password},
     db::{NewProvider, ProviderKind, ProviderSummary, ProviderUpdate},
     provider::{ProviderMutationError, ProviderToolMapping},
@@ -29,31 +29,25 @@ pub fn routes() -> Router<AppState> {
         .route("/requests", get(requests))
 }
 
-#[derive(RustEmbed)]
-#[folder = "web/dist/"]
-struct AdminAssets;
+pub fn cors_layer(config: &AdminConfig) -> CorsLayer {
+    let origins = config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
 
-pub async fn spa() -> impl IntoResponse {
-    asset_response("index.html")
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true)
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-csrf-token"),
+        ])
 }
 
-pub async fn asset(Path(path): Path<String>) -> impl IntoResponse {
-    asset_response(&format!("assets/{path}"))
-}
-
-fn asset_response(path: &str) -> axum::response::Response {
-    match AdminAssets::get(path) {
-        Some(file) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                mime_guess::from_path(path).first_or_octet_stream().as_ref(),
-            )],
-            file.data,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+fn api_error(status: StatusCode, message: &'static str) -> Response {
+    (status, Json(json!({"error": message}))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -64,17 +58,13 @@ struct Login {
 
 async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> impl IntoResponse {
     if input.username.len() > 128 || input.password.len() > 1024 {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid credentials"})),
-        )
-            .into_response();
+        return api_error(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
     let credentials = match state.db.admin_credentials().await {
         Ok(credentials) => credentials,
         Err(error) => {
             tracing::error!(%error, "could not read administrator credentials");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
         }
     };
     let authenticated = match credentials {
@@ -91,18 +81,14 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> impl 
                 Ok(authenticated) => authenticated,
                 Err(error) => {
                     tracing::error!(%error, "administrator password verification failed");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
                 }
             }
         }
         None => false,
     };
     if !authenticated {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid credentials"})),
-        )
-            .into_response();
+        return api_error(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
     let token = random_secret(32);
     let csrf = random_secret(32);
@@ -118,11 +104,10 @@ async fn login(State(state): State<AppState>, Json(input): Json<Login>) -> impl 
         tracing::error!(%error, "could not create admin session");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let cookie = format!(
-        "gateway_session={token}; Path=/admin; HttpOnly; SameSite=Strict; Secure; Max-Age=28800"
-    );
-    let csrf_cookie =
-        format!("gateway_csrf={csrf}; Path=/admin; SameSite=Strict; Secure; Max-Age=28800");
+    let cookie_attributes = cookie_attributes(&state.admin);
+    let cookie =
+        format!("gateway_session={token}; Path=/; HttpOnly; {cookie_attributes}; Max-Age=28800");
+    let csrf_cookie = format!("gateway_csrf={csrf}; Path=/; {cookie_attributes}; Max-Age=28800");
     let mut response = (
         StatusCode::OK,
         Json(json!({"csrf_token":csrf,"expires_at":expires})),
@@ -145,22 +130,31 @@ async fn session(_auth: AdminRead) -> impl IntoResponse {
 async fn logout(AdminWrite(id): AdminWrite, State(state): State<AppState>) -> impl IntoResponse {
     if let Err(error) = state.db.delete_admin_session(&id).await {
         tracing::error!(%error, "could not delete admin session");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
     }
     let mut response = (StatusCode::NO_CONTENT,).into_response();
+    let cookie_attributes = cookie_attributes(&state.admin);
     response.headers_mut().append(
         header::SET_COOKIE,
-        "gateway_session=; Path=/admin; HttpOnly; SameSite=Strict; Secure; Max-Age=0"
+        format!("gateway_session=; Path=/; HttpOnly; {cookie_attributes}; Max-Age=0")
             .parse()
             .expect("valid cookie"),
     );
     response.headers_mut().append(
         header::SET_COOKIE,
-        "gateway_csrf=; Path=/admin; SameSite=Strict; Secure; Max-Age=0"
+        format!("gateway_csrf=; Path=/; {cookie_attributes}; Max-Age=0")
             .parse()
             .expect("valid cookie"),
     );
     response
+}
+
+fn cookie_attributes(config: &AdminConfig) -> &'static str {
+    if config.secure_cookies {
+        "SameSite=None; Secure"
+    } else {
+        "SameSite=Lax"
+    }
 }
 
 async fn admin_auth(state: &AppState, headers: &HeaderMap, write: bool) -> Option<String> {
@@ -190,7 +184,7 @@ struct AdminRead;
 struct AdminWrite(String);
 
 impl FromRequestParts<AppState> for AdminRead {
-    type Rejection = StatusCode;
+    type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -199,12 +193,12 @@ impl FromRequestParts<AppState> for AdminRead {
         admin_auth(state, &parts.headers, false)
             .await
             .map(|_| Self)
-            .ok_or(StatusCode::UNAUTHORIZED)
+            .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "authentication required"))
     }
 }
 
 impl FromRequestParts<AppState> for AdminWrite {
-    type Rejection = StatusCode;
+    type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -213,7 +207,7 @@ impl FromRequestParts<AppState> for AdminWrite {
         admin_auth(state, &parts.headers, true)
             .await
             .map(Self)
-            .ok_or(StatusCode::UNAUTHORIZED)
+            .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "authentication required"))
     }
 }
 
@@ -222,7 +216,7 @@ async fn keys(_auth: AdminRead, State(state): State<AppState>) -> impl IntoRespo
         Ok(rows) => Json(rows).into_response(),
         Err(error) => {
             tracing::error!(%error, "could not list client API keys");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
         }
     }
 }
@@ -237,7 +231,7 @@ async fn create_key(
     Json(input): Json<Name>,
 ) -> impl IntoResponse {
     if input.name.trim().is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
+        return api_error(StatusCode::BAD_REQUEST, "name is required");
     }
     let secret = format!("tmg_{}", random_secret(32));
     let prefix = secret.chars().take(12).collect::<String>();
@@ -253,7 +247,7 @@ async fn create_key(
             .into_response(),
         Err(error) => {
             tracing::warn!(%error, "could not create client API key");
-            StatusCode::BAD_REQUEST.into_response()
+            api_error(StatusCode::BAD_REQUEST, "could not create client API key")
         }
     }
 }
@@ -282,7 +276,7 @@ async fn providers(_auth: AdminRead, State(state): State<AppState>) -> impl Into
         .into_response(),
         Err(error) => {
             tracing::error!(%error, "could not list providers");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
         }
     }
 }
@@ -301,7 +295,7 @@ async fn create_provider(
     Json(input): Json<ProviderInput>,
 ) -> impl IntoResponse {
     let Some(token) = input.token.filter(|token| !token.is_empty()) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return api_error(StatusCode::BAD_REQUEST, "token is required");
     };
     let id = match state
         .providers
@@ -318,15 +312,15 @@ async fn create_provider(
         Ok(id) => id,
         Err(ProviderMutationError::Invalid(error)) => {
             tracing::warn!(error, "invalid provider configuration");
-            return StatusCode::BAD_REQUEST.into_response();
+            return api_error(StatusCode::BAD_REQUEST, "invalid provider configuration");
         }
         Err(ProviderMutationError::Connection(error)) => {
             tracing::warn!(%error, "could not connect provider");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return api_error(StatusCode::BAD_GATEWAY, "could not connect provider");
         }
         Err(ProviderMutationError::Storage(error)) => {
             tracing::error!(%error, "could not persist provider");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
         }
     };
     (StatusCode::CREATED, Json(json!({"id":id}))).into_response()
@@ -355,28 +349,28 @@ async fn update_provider(
         Ok(updated) => updated,
         Err(ProviderMutationError::Invalid(error)) => {
             tracing::warn!(error, provider_id = id, "invalid provider configuration");
-            return StatusCode::BAD_REQUEST;
+            return api_error(StatusCode::BAD_REQUEST, "invalid provider configuration");
         }
         Err(ProviderMutationError::Connection(error)) => {
             tracing::warn!(%error, provider_id = id, "could not connect updated provider");
-            return StatusCode::BAD_GATEWAY;
+            return api_error(StatusCode::BAD_GATEWAY, "could not connect provider");
         }
         Err(ProviderMutationError::Storage(error)) => {
             tracing::error!(%error, provider_id = id, "could not persist provider update");
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error");
         }
     };
     if !updated {
-        return StatusCode::NOT_FOUND;
+        return api_error(StatusCode::NOT_FOUND, "provider not found");
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 async fn overview(_auth: AdminRead, State(state): State<AppState>) -> impl IntoResponse {
     match state.db.usage_overview().await {
         Ok(overview) => Json(overview).into_response(),
         Err(error) => {
             tracing::error!(%error, "could not load usage overview");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
         }
     }
 }
@@ -385,7 +379,7 @@ async fn requests(_auth: AdminRead, State(state): State<AppState>) -> impl IntoR
         Ok(requests) => Json(requests).into_response(),
         Err(error) => {
             tracing::error!(%error, "could not load recent requests");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
         }
     }
 }

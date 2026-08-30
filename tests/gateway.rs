@@ -19,7 +19,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tavily_mcp_gateway::{
-    AppState, admin, app,
+    AdminConfig, AppState, admin, app,
     auth::digest,
     catalog::canonical_tools,
     db::{Database, NewProvider, ProviderKind, ProviderUpdate, RequestRecord},
@@ -121,7 +121,11 @@ async fn state() -> (AppState, tempfile::TempDir) {
             .await
             .expect("load providers"),
     );
-    let state = AppState { db, providers };
+    let state = AppState {
+        db,
+        providers,
+        admin: AdminConfig::default(),
+    };
     admin::bootstrap(&state.db, "admin", Some("correct horse battery staple"))
         .await
         .expect("bootstrap");
@@ -353,7 +357,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let response = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/login")
+            Request::post("/api/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(login_body))
                 .unwrap(),
@@ -368,6 +372,8 @@ async fn admin_csrf_and_repeatable_client_keys() {
         .map(|v| {
             let value = v.to_str().unwrap();
             assert!(value.contains("; Secure"));
+            assert!(value.contains("; Path=/;"));
+            assert!(value.contains("SameSite=None"));
             value.split(';').next().unwrap().to_owned()
         })
         .collect::<Vec<_>>();
@@ -381,7 +387,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let no_csrf = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/providers")
+            Request::post("/api/providers")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, &cookie)
                 .body(Body::from(create.clone()))
@@ -393,7 +399,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let created = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/providers")
+            Request::post("/api/providers")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, &cookie)
                 .header("x-csrf-token", csrf)
@@ -406,7 +412,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let listed = gateway
         .clone()
         .oneshot(
-            Request::get("/admin/api/providers")
+            Request::get("/api/providers")
                 .header(header::COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -424,7 +430,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let created_key_response = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/keys")
+            Request::post("/api/keys")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, &cookie)
                 .header("x-csrf-token", csrf)
@@ -439,7 +445,7 @@ async fn admin_csrf_and_repeatable_client_keys() {
     let listed_keys = gateway
         .clone()
         .oneshot(
-            Request::get("/admin/api/keys")
+            Request::get("/api/keys")
                 .header(header::COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -448,6 +454,78 @@ async fn admin_csrf_and_repeatable_client_keys() {
         .unwrap();
     let listed_keys = body_json(listed_keys).await;
     assert_eq!(listed_keys[0]["key"].as_str(), Some(original_key.as_str()));
+}
+
+#[tokio::test]
+async fn admin_api_enforces_configured_cors_origins() {
+    let (mut state, _dir) = state().await;
+    state.admin.cors_origins = vec!["https://console.example".into()];
+    let gateway = app(state);
+
+    let preflight = gateway
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/login")
+                .header("Origin", "https://console.example")
+                .header("Access-Control-Request-Method", "POST")
+                .header(
+                    "Access-Control-Request-Headers",
+                    "content-type,x-csrf-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("Access-Control-Allow-Origin")
+            .unwrap(),
+        "https://console.example"
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("Access-Control-Allow-Credentials")
+            .unwrap(),
+        "true"
+    );
+    assert!(
+        preflight
+            .headers()
+            .get("Access-Control-Allow-Headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("x-csrf-token")
+    );
+
+    let disallowed = gateway
+        .clone()
+        .oneshot(
+            Request::get("/api/session")
+                .header("Origin", "https://other.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disallowed.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        !disallowed
+            .headers()
+            .contains_key("Access-Control-Allow-Origin")
+    );
+
+    let legacy = gateway
+        .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -854,7 +932,7 @@ async fn enabled_provider_creation_connects_before_activation() {
     let login = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/login")
+            Request::post("/api/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"username":"admin","password":"correct horse battery staple"})
@@ -885,7 +963,7 @@ async fn enabled_provider_creation_connects_before_activation() {
     let created = gateway
         .clone()
         .oneshot(
-            Request::post("/admin/api/providers")
+            Request::post("/api/providers")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::COOKIE, cookies.join("; "))
                 .header("x-csrf-token", csrf)
@@ -909,7 +987,7 @@ async fn enabled_provider_creation_connects_before_activation() {
     assert!(created["id"].is_number());
     let listed = gateway
         .oneshot(
-            Request::get("/admin/api/providers")
+            Request::get("/api/providers")
                 .header(header::COOKIE, cookies.join("; "))
                 .body(Body::empty())
                 .unwrap(),

@@ -13,19 +13,34 @@ use axum::{Router, routing::get};
 use db::Database;
 use provider::ProviderManager;
 
+#[derive(Clone, Debug)]
+pub struct AdminConfig {
+    pub cors_origins: Vec<String>,
+    pub secure_cookies: bool,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            cors_origins: Vec::new(),
+            secure_cookies: true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub providers: Arc<ProviderManager>,
+    pub admin: AdminConfig,
 }
 
 pub fn app(state: AppState) -> Router {
+    let admin_routes = admin::routes().layer(admin::cors_layer(&state.admin));
+
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
         .nest("/mcp", mcp::routes(state.clone()))
-        .nest("/admin/api", admin::routes())
-        .route("/admin", get(admin::spa))
-        .route("/admin/assets/{*path}", get(admin::asset))
-        .route("/admin/{*path}", get(admin::spa))
+        .nest("/api", admin_routes)
         .with_state(state)
 }

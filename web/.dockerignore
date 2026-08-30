@@ -1,0 +1,7 @@
+node_modules
+.output
+dist
+.git
+.agents
+.codex
+*.log

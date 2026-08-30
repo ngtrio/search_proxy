@@ -5,9 +5,11 @@ services:
     environment:
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      ADMIN_CORS_ORIGINS: ${ADMIN_CORS_ORIGINS:-http://localhost:8080}
+      ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-true}
       DATABASE_URL: sqlite:///data/gateway.db?mode=rwc
     volumes:
-      - gateway-data:/data
+      - ./data:/data
     ports:
       - "127.0.0.1:3000:3000"
     healthcheck:
@@ -15,5 +17,20 @@ services:
       interval: 15s
       timeout: 3s
       retries: 5
-volumes:
-  gateway-data:
+
+  frontend:
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5

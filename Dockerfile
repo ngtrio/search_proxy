@@ -1,16 +1,9 @@
-FROM node:22-alpine AS web
-WORKDIR /app/web
-COPY web/package.json web/pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
-COPY web .
-RUN pnpm build
-
-FROM rust:1.88-bookworm AS rust
+FROM rust:1.94-bookworm AS rust
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY migrations migrations
+COPY schemas schemas
 COPY src src
-COPY --from=web /app/web/dist web/dist
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

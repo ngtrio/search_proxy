@@ -1,10 +1,14 @@
 # Operations
 
-The gateway is a single-process service. Its SQLite database contains plaintext upstream tokens and client API keys by explicit design; active client API keys are also visible to authenticated administrators in the key list. Protect the data volume and every backup as credentials.
+The gateway backend is a single-process service, deployed alongside a separate TanStack Start administration frontend. The SQLite database contains plaintext upstream tokens and client API keys by explicit design; active client API keys are also visible to authenticated administrators in the key list. Protect the data volume and every backup as credentials.
 
 ## Deploy
 
-Copy `.env.example` to `.env`, set a long administrator password, then run `docker compose up -d --build`. Put the service behind TLS. Restrict the Docker host, `/var/lib/docker/volumes`, and backup directory to administrators.
+Copy `.env.example` to `.env`, set a long administrator password and set `ADMIN_CORS_ORIGINS` to the public frontend origin. `docker compose up -d --build` builds and starts both the Rust gateway and the TanStack Start frontend. The frontend listens on `127.0.0.1:8080`; the backend listens on `127.0.0.1:3000`. Put your Caddy deployment in front of them: route `/api/*` and `/mcp*` to the gateway and all other paths to the frontend. Set `VITE_API_BASE_URL` to the public backend URL before building, or leave it empty when Caddy exposes `/api` on the frontend's same public origin. Put both services behind TLS and set `ADMIN_COOKIE_SECURE=true`. Restrict the Docker host, the repository's `data` directory, and the backup directory to administrators.
+
+Compose bind-mounts the repository's `./data` directory at `/data` in the gateway container. Create it before the first start and ensure it is writable by the container's UID 10001. The directory is excluded from Git because it contains the live SQLite database and plaintext credentials.
+
+The Compose deployment publishes the backend on `127.0.0.1:3000` and the frontend on `127.0.0.1:8080`. The backend does not serve the frontend or `/admin` routes. Administration endpoints are available under `/api`; the frontend is a Node service, not a static `web/dist` directory.
 
 Liveness (`/health/live`) only confirms that the process responds.
 
@@ -12,7 +16,7 @@ An enabled provider that cannot connect during startup causes the gateway to fai
 
 ## TLS and request handling
 
-The Compose deployment publishes the gateway only on `127.0.0.1:3000`; this repository does not install or configure a reverse proxy. Terminate TLS in the deployment environment and keep that configuration with the infrastructure that owns it.
+This repository does not install or configure a reverse proxy. Terminate TLS in the deployment environment and keep that configuration with the infrastructure that owns it. Configure `ADMIN_CORS_ORIGINS` as an exact allowlist; wildcard origins are rejected. The browser must be able to reach the public value of `VITE_API_BASE_URL`.
 
 MCP Streamable HTTP responses may use SSE, and long-running tools may keep one request open for several minutes. Every hop in front of the gateway must therefore pass streaming responses without buffering and use request, response-header, and idle timeouts suitable for the longest enabled provider call. The gateway does not impose a per-provider tool-call timeout.
 
@@ -20,7 +24,7 @@ The Compose healthcheck's three-second timeout applies only to `/health/live`; i
 
 ## Backup and restore
 
-Use SQLite's online backup command inside the volume so WAL contents are included:
+Use SQLite's online backup command against the mounted `/data` directory so WAL contents are included:
 
 ```sh
 sqlite3 /data/gateway.db ".backup '/data/backup-$(date +%F).db'"

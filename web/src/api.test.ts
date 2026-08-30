@@ -1,1 +1,21 @@
-import{describe,expect,it}from"vitest";import{canonicalTools}from"./api";import type{Provider,ToolMapping}from"./api";describe("admin contracts",()=>{it("does not expose provider token fields",()=>{const fields:keyof Provider="token_configured";expect(fields).toBe("token_configured")});it("models the canonical-to-upstream tool mapping",()=>{const mapping:ToolMapping={canonical_tool:"tavily_search",upstream_tool:"search_proxy_tavily_search"};expect(mapping.upstream_tool).not.toBe(mapping.canonical_tool);expect(canonicalTools).toHaveLength(5)})});
+import { describe, expect, it } from "vitest";
+import { apiUrl, canonicalTools } from "./api";
+import type { Provider, ToolMapping } from "./api";
+
+describe("admin contracts", () => {
+  it("does not expose provider token fields", () => {
+    const fields: keyof Provider = "token_configured";
+    expect(fields).toBe("token_configured");
+  });
+
+  it("models the canonical-to-upstream tool mapping", () => {
+    const mapping: ToolMapping = { canonical_tool: "tavily_search", upstream_tool: "search_proxy_tavily_search" };
+    expect(mapping.upstream_tool).not.toBe(mapping.canonical_tool);
+    expect(canonicalTools).toHaveLength(5);
+  });
+
+  it("builds API URLs from the configured backend base URL", () => {
+    expect(apiUrl("/session")).toBe("/api/session");
+    expect(apiUrl("providers")).toBe("/api/providers");
+  });
+});
