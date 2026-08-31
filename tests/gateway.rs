@@ -184,6 +184,7 @@ async fn public_metrics_are_aggregated_validated_and_anonymous() {
     assert_eq!(response.status(), StatusCode::OK);
     let metrics = body_json(response).await;
     assert_eq!(metrics["window"], "1h");
+    assert_eq!(metrics["bucket_seconds"], 60);
     assert_eq!(metrics["summary"]["requests"]["value"], 4);
     assert_eq!(metrics["summary"]["success_rate"]["value"], 75.0);
     assert_eq!(metrics["summary"]["p50_ms"]["value"], 20);
@@ -213,6 +214,79 @@ async fn public_metrics_are_aggregated_validated_and_anonymous() {
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn all_metrics_include_full_history_without_a_previous_period() {
+    let (state, dir) = state().await;
+    let key_id = state
+        .db
+        .create_client_key(
+            "all-metrics",
+            "tmg_all",
+            &digest("all-secret"),
+            "all-secret",
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .record_request(RequestRecord {
+            id: "all-history-request",
+            client_key_id: key_id,
+            provider_id: None,
+            duration_ms: 125,
+            outcome: "success",
+            error_category: None,
+        })
+        .await
+        .unwrap();
+
+    let database_url = format!("sqlite://{}", dir.path().join("gateway.db").display());
+    let pool = SqlitePool::connect(&database_url).await.unwrap();
+    sqlx::query("UPDATE request_events SET started_at = datetime('now', '-45 days') WHERE id = ?")
+        .bind("all-history-request")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::get("/api/metrics?window=all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = body_json(response).await;
+    assert_eq!(metrics["window"], "all");
+    assert_eq!(metrics["bucket_seconds"], 21_600);
+    assert_eq!(metrics["summary"]["requests"]["value"], 1);
+    assert_eq!(metrics["summary"]["success_rate"]["value"], 100.0);
+    assert_eq!(metrics["summary"]["p50_ms"]["value"], 125);
+    assert!(metrics["summary"]["requests"]["change"].is_null());
+    assert!(metrics["summary"]["success_rate"]["change"].is_null());
+    assert!(metrics["summary"]["p50_ms"]["change"].is_null());
+    assert!(metrics["series"].as_array().unwrap().len() <= 300);
+}
+
+#[tokio::test]
+async fn all_metrics_use_a_safe_range_when_history_is_empty() {
+    let (state, _dir) = state().await;
+    let response = app(state)
+        .oneshot(
+            Request::get("/api/metrics?window=all")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = body_json(response).await;
+    assert_eq!(metrics["bucket_seconds"], 60);
+    assert_eq!(metrics["summary"]["requests"]["value"], 0);
+    assert_eq!(metrics["series"].as_array().unwrap().len(), 60);
 }
 
 async fn body_sse_json(response: axum::response::Response) -> Value {

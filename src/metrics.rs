@@ -22,6 +22,7 @@ pub enum Window {
     TwentyFourHours,
     SevenDays,
     ThirtyDays,
+    All,
 }
 
 impl Window {
@@ -31,6 +32,7 @@ impl Window {
             "24h" => Some(Self::TwentyFourHours),
             "7d" => Some(Self::SevenDays),
             "30d" => Some(Self::ThirtyDays),
+            "all" => Some(Self::All),
             _ => None,
         }
     }
@@ -41,26 +43,44 @@ impl Window {
             Self::TwentyFourHours => "24h",
             Self::SevenDays => "7d",
             Self::ThirtyDays => "30d",
+            Self::All => "all",
         }
     }
 
-    fn duration(self) -> Duration {
+    fn duration(self) -> Option<Duration> {
         match self {
-            Self::OneHour => Duration::hours(1),
-            Self::TwentyFourHours => Duration::hours(24),
-            Self::SevenDays => Duration::days(7),
-            Self::ThirtyDays => Duration::days(30),
+            Self::OneHour => Some(Duration::hours(1)),
+            Self::TwentyFourHours => Some(Duration::hours(24)),
+            Self::SevenDays => Some(Duration::days(7)),
+            Self::ThirtyDays => Some(Duration::days(30)),
+            Self::All => None,
         }
     }
 
-    fn bucket_seconds(self) -> i64 {
+    fn bucket_seconds(self) -> Option<i64> {
         match self {
-            Self::OneHour => 60,
-            Self::TwentyFourHours => 300,
-            Self::SevenDays => 3_600,
-            Self::ThirtyDays => 21_600,
+            Self::OneHour => Some(60),
+            Self::TwentyFourHours => Some(300),
+            Self::SevenDays => Some(3_600),
+            Self::ThirtyDays => Some(21_600),
+            Self::All => None,
         }
     }
+}
+
+fn all_bucket_seconds(span_seconds: i64) -> i64 {
+    const MAX_BUCKETS: i64 = 300;
+    const YEAR: i64 = 365 * 24 * 60 * 60;
+    const INTERVALS: [i64; 8] = [60, 300, 3_600, 21_600, 86_400, 604_800, 2_592_000, YEAR];
+
+    INTERVALS
+        .into_iter()
+        .find(|interval| ceiling_division(span_seconds, *interval) <= MAX_BUCKETS)
+        .unwrap_or_else(|| ceiling_division(span_seconds, MAX_BUCKETS * YEAR) * YEAR)
+}
+
+fn ceiling_division(value: i64, divisor: i64) -> i64 {
+    value / divisor + i64::from(value % divisor != 0)
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +102,7 @@ pub struct MetricsResponse {
     pub window: &'static str,
     pub generated_at: String,
     pub timezone: &'static str,
+    pub bucket_seconds: i64,
     pub summary: Summary,
     pub series: Vec<crate::db::MetricBucket>,
     pub activity: Vec<crate::db::ActivityBucket>,
@@ -104,7 +125,7 @@ pub async fn handler(State(state): State<AppState>, Query(query): Query<MetricsQ
     let Some(window) = Window::parse(query.window.as_deref()) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error":"window must be one of 1h, 24h, 7d, 30d"})),
+            Json(json!({"error":"window must be one of 1h, 24h, 7d, 30d, all"})),
         )
             .into_response();
     };
@@ -113,16 +134,31 @@ pub async fn handler(State(state): State<AppState>, Query(query): Query<MetricsQ
     // SQLite timestamps have whole-second precision. Make the exclusive upper
     // bound the next second so requests written during this second are visible.
     let end = generated_at + Duration::seconds(1);
-    let start = end - window.duration();
-    let previous_start = start - window.duration();
-    let metrics_window = MetricsWindow {
-        start: start.timestamp(),
-        end: end.timestamp(),
-        previous_start: previous_start.timestamp(),
-        bucket_seconds: window.bucket_seconds(),
-    };
 
     let result = async {
+        let metrics_window = if let (Some(duration), Some(bucket_seconds)) =
+            (window.duration(), window.bucket_seconds())
+        {
+            let start = end - duration;
+            MetricsWindow {
+                start: start.timestamp(),
+                end: end.timestamp(),
+                previous_start: (start - duration).timestamp(),
+                bucket_seconds,
+            }
+        } else {
+            let start = state
+                .db
+                .first_request_timestamp()
+                .await?
+                .unwrap_or_else(|| (end - Duration::hours(1)).timestamp());
+            MetricsWindow {
+                start,
+                end: end.timestamp(),
+                previous_start: start,
+                bucket_seconds: all_bucket_seconds((end.timestamp() - start).max(1)),
+            }
+        };
         let summary = state.db.metric_summary(&metrics_window).await?;
         let series = state.db.metric_series(&metrics_window).await?;
         let fixed_24h = MetricsWindow {
@@ -136,12 +172,18 @@ pub async fn handler(State(state): State<AppState>, Query(query): Query<MetricsQ
             .db
             .latency_distribution(fixed_24h.start, fixed_24h.end)
             .await?;
-        Ok::<_, sqlx::Error>((summary, series, activity, latency_distribution))
+        Ok::<_, sqlx::Error>((
+            metrics_window.bucket_seconds,
+            summary,
+            series,
+            activity,
+            latency_distribution,
+        ))
     }
     .await;
 
     match result {
-        Ok((values, series, activity, latency_distribution)) => {
+        Ok((bucket_seconds, values, series, activity, latency_distribution)) => {
             let current_rate = (values.current_requests > 0)
                 .then(|| values.current_successes as f64 / values.current_requests as f64 * 100.0);
             let previous_rate = (values.previous_requests > 0).then(|| {
@@ -151,6 +193,7 @@ pub async fn handler(State(state): State<AppState>, Query(query): Query<MetricsQ
                 window: window.label(),
                 generated_at: iso(generated_at),
                 timezone: "UTC",
+                bucket_seconds,
                 summary: Summary {
                     requests: MetricValue {
                         value: values.current_requests,

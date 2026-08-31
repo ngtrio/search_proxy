@@ -21,7 +21,7 @@ impl Config {
 
         Ok(Self {
             bind: env::var("GATEWAY_BIND")
-                .unwrap_or_else(|_| "0.0.0.0:3000".into())
+                .unwrap_or_else(|_| "0.0.0.0:8080".into())
                 .parse()?,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/gateway.db?mode=rwc".into()),

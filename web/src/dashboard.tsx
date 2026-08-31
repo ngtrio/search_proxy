@@ -1,33 +1,13 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Moon, Sun, WarningCircle } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
-import { Area, Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { ArrowDown, ArrowUp, GearSix, Moon, Sun, WarningCircle } from "@phosphor-icons/react";
+import { Link } from "@tanstack/react-router";
+import { useState } from "react";
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api, metricWindows } from "./api";
 import type { MetricWindow, MetricsData } from "./api";
-import { changeLabel, formatAxisTime, formatCompact, formatFullTime, formatMetric, trendMeta } from "./metrics";
-
-type Theme = "dark" | "light";
-const themeKey = "search-proxy-theme";
-
-function preferredTheme(): Theme {
-  try {
-    const stored = window.localStorage.getItem(themeKey);
-    if (stored === "dark" || stored === "light") return stored;
-  } catch {
-    // System preference remains available when storage is blocked.
-  }
-  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-}
-
-export function useTheme() {
-  const [theme, setTheme] = useState<Theme>("dark");
-  useEffect(() => setTheme(preferredTheme()), []);
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    try { window.localStorage.setItem(themeKey, theme); } catch { /* Theme still applies for this visit. */ }
-  }, [theme]);
-  return [theme, setTheme] as const;
-}
+import { changeLabel, formatAxisTime, formatBucketLabel, formatCompact, formatFullTime, formatMetric, metricWindowLabel, requestChartData, trendMeta } from "./metrics";
+import { useTheme } from "./theme";
+import type { Theme } from "./theme";
 
 export function Dashboard() {
   const [window, setWindow] = useState<MetricWindow>("24h");
@@ -49,7 +29,8 @@ function Header({ window, onWindow, theme, onTheme, updatedAt, refreshing }: { w
   return <header className="topbar">
     <div className="brand-block"><div className="brand-mark" aria-hidden="true"><span /><span /><span /></div><div><h1>Search Proxy</h1><p>请求流量监控 / Traffic observability</p></div></div>
     <div className="header-controls">
-      <div className="window-tabs" aria-label="时间窗口">{metricWindows.map((item) => <button key={item} className={item === window ? "active" : ""} aria-pressed={item === window} onClick={() => onWindow(item)}>{item}</button>)}</div>
+      <div className="window-tabs" aria-label="时间窗口">{metricWindows.map((item) => <button key={item} className={item === window ? "active" : ""} aria-pressed={item === window} onClick={() => onWindow(item)}>{metricWindowLabel(item)}</button>)}</div>
+      <Link className="console-link" to="/admin" aria-label="进入控制台"><GearSix size={16} />控制台</Link>
       <button className="icon-button" onClick={onTheme} aria-label={theme === "dark" ? "切换至浅色主题" : "切换至深色主题"} title="切换主题">{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button>
       <div className="sync-state"><span className={refreshing ? "sync-pulse" : ""} />{updatedAt ? formatFullTime(updatedAt) : "同步中"}</div>
     </div>
@@ -58,10 +39,10 @@ function Header({ window, onWindow, theme, onTheme, updatedAt, refreshing }: { w
 
 function DashboardBody({ data, window }: { data: MetricsData; window: MetricWindow }) {
   const empty = data.series.every((point) => point.requests === 0);
-  return <div className="dashboard-content"><MetricStrip data={data} />{empty ? <EmptyState /> : <TrafficChart data={data} window={window} />}<div className="lower-grid"><ActivityHeatmap data={data} /><LatencyDistribution data={data} /></div></div>;
+  return <div className="dashboard-content"><MetricStrip data={data} window={window} />{empty ? <EmptyState /> : <TrafficChart data={data} window={window} />}<div className="lower-grid"><ActivityHeatmap data={data} /><LatencyDistribution data={data} /></div></div>;
 }
 
-function MetricStrip({ data }: { data: MetricsData }) {
+function MetricStrip({ data, window }: { data: MetricsData; window: MetricWindow }) {
   const metrics = [
     { label: "请求量", en: "REQUESTS", value: formatMetric(data.summary.requests.value, "requests"), change: data.summary.requests.change, kind: "percent" as const, latency: false },
     { label: "成功率", en: "SUCCESS RATE", value: formatMetric(data.summary.success_rate.value, "rate"), change: data.summary.success_rate.change, kind: "points" as const, latency: false },
@@ -70,7 +51,8 @@ function MetricStrip({ data }: { data: MetricsData }) {
   ];
   return <section className="metric-strip" aria-label="关键指标">{metrics.map((metric) => {
     const trend = trendMeta(metric.change, metric.latency);
-    return <article className="metric-cell" key={metric.en}><div className="metric-label"><span>{metric.label}</span><small>{metric.en}</small></div><strong>{metric.value}</strong><div className={`metric-change ${trend.improved === true ? "good" : trend.improved === false ? "bad" : "neutral"}`}>{trend.direction === "up" ? <ArrowUp size={12} /> : trend.direction === "down" ? <ArrowDown size={12} /> : null}{changeLabel(metric.change, metric.kind)} <span>对比上一周期</span></div></article>;
+    const allTime = window === "all";
+    return <article className="metric-cell" key={metric.en}><div className="metric-label"><span>{metric.label}</span><small>{metric.en}</small></div><strong>{metric.value}</strong><div className={`metric-change ${allTime ? "neutral" : trend.improved === true ? "good" : trend.improved === false ? "bad" : "neutral"}`}>{allTime ? "全部时间" : <>{trend.direction === "up" ? <ArrowUp size={12} /> : trend.direction === "down" ? <ArrowDown size={12} /> : null}{changeLabel(metric.change, metric.kind)} <span>对比上一周期</span></>}</div></article>;
   })}</section>;
 }
 
@@ -79,17 +61,16 @@ function SectionHeading({ title, english, legend }: { title: string; english: st
 }
 
 function TrafficChart({ data, window }: { data: MetricsData; window: MetricWindow }) {
-  const chartData = data.series.map((point) => ({ ...point, label: formatAxisTime(point.timestamp, window) }));
-  return <section className="panel traffic-panel"><SectionHeading title="流量与延迟" english="TRAFFIC & LATENCY" legend={<div className="legend"><span className="requests">请求量</span><span className="p50">P50</span><span className="p95">P95</span><span className="failures">失败</span></div>} /><div className="chart-wrap" aria-label="请求量、失败数与延迟趋势图"><ResponsiveContainer width="100%" height="100%"><ComposedChart data={chartData} margin={{ top: 14, right: 0, bottom: 0, left: -12 }}>
-    <defs><linearGradient id="traffic-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--gold)" stopOpacity=".28" /><stop offset="100%" stopColor="var(--gold)" stopOpacity="0" /></linearGradient></defs>
-    <CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={window === "1h" ? 48 : 72} /><YAxis yAxisId="requests" tickFormatter={formatCompact} tick={{ fill: "var(--muted)", fontSize: 10 }} axisLine={false} tickLine={false} width={52} /><YAxis yAxisId="latency" orientation="right" tickFormatter={(value) => `${value}ms`} tick={{ fill: "var(--muted)", fontSize: 10 }} axisLine={false} tickLine={false} width={54} />
-    <Tooltip content={<ChartTooltip />} cursor={{ stroke: "var(--crosshair)", strokeWidth: 1 }} /><Area yAxisId="requests" type="monotone" dataKey="requests" stroke="var(--gold)" fill="url(#traffic-fill)" strokeWidth={1.5} isAnimationActive={false} /><Bar yAxisId="requests" dataKey="failures" fill="var(--red)" opacity={0.72} barSize={3} isAnimationActive={false} /><Line yAxisId="latency" type="monotone" dataKey="p50_ms" stroke="var(--cyan)" strokeWidth={1.5} dot={false} connectNulls={false} isAnimationActive={false} /><Line yAxisId="latency" type="monotone" dataKey="p95_ms" stroke="var(--cyan)" strokeWidth={1.2} strokeDasharray="4 4" dot={false} connectNulls={false} isAnimationActive={false} />
-  </ComposedChart></ResponsiveContainer></div></section>;
+  const chartData = requestChartData(data.series).map((point) => ({ ...point, label: formatAxisTime(point.timestamp, window) }));
+  return <section className="panel traffic-panel"><SectionHeading title="请求趋势" english={formatBucketLabel(data.bucket_seconds)} legend={<div className="legend"><span className="successes">成功</span><span className="failures">失败</span></div>} /><div className="chart-wrap" aria-label="按时间桶统计的成功与失败请求趋势图"><ResponsiveContainer width="100%" height="100%"><BarChart data={chartData} margin={{ top: 14, right: 0, bottom: 0, left: -12 }}>
+    <CartesianGrid stroke="var(--grid)" vertical={false} /><XAxis dataKey="label" tick={{ fill: "var(--muted)", fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={window === "1h" ? 48 : 72} /><YAxis tickFormatter={formatCompact} tick={{ fill: "var(--muted)", fontSize: 10 }} axisLine={false} tickLine={false} width={52} />
+    <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--grid)", opacity: .45 }} /><Bar dataKey="successes" stackId="requests" fill="var(--gold)" opacity={.82} maxBarSize={10} isAnimationActive={false} /><Bar dataKey="failures" stackId="requests" fill="var(--red)" maxBarSize={10} isAnimationActive={false} />
+  </BarChart></ResponsiveContainer></div></section>;
 }
 
-function ChartTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: MetricsData["series"][number] }> }) {
+function ChartTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: MetricsData["series"][number] & { successes: number } }> }) {
   const point = payload?.[0]?.payload; if (!active || !point) return null;
-  return <div className="chart-tooltip"><time>{formatFullTime(point.timestamp)}</time><dl><div><dt>请求</dt><dd>{point.requests}</dd></div><div><dt>失败</dt><dd className="red">{point.failures}</dd></div><div><dt>P50</dt><dd>{formatMetric(point.p50_ms, "latency")}</dd></div><div><dt>P95</dt><dd>{formatMetric(point.p95_ms, "latency")}</dd></div></dl></div>;
+  return <div className="chart-tooltip"><time>{formatFullTime(point.timestamp)}</time><dl><div><dt>请求</dt><dd>{point.requests}</dd></div><div><dt>成功</dt><dd>{point.successes}</dd></div><div><dt>失败</dt><dd className="red">{point.failures}</dd></div></dl></div>;
 }
 
 function ActivityHeatmap({ data }: { data: MetricsData }) {
@@ -99,7 +80,7 @@ function ActivityHeatmap({ data }: { data: MetricsData }) {
 
 function LatencyDistribution({ data }: { data: MetricsData }) {
   const max = Math.max(...data.latency_distribution.map((point) => point.p95_ms ?? 0), 1);
-  return <section className="panel latency-panel"><SectionHeading title="延迟分布" english="PERCENTILE / HOURLY" legend={<div className="legend"><span className="p5">P5</span><span className="p50">P50</span><span className="p95">P95</span></div>} /><div className="latency-scroll"><div className="latency-columns">{data.latency_distribution.map((point, index) => {
+  return <section className="panel latency-panel"><SectionHeading title="近 24 小时延迟分布" english="HOURLY PERCENTILES / LAST 24H" legend={<div className="legend"><span className="p5">P5</span><span className="p50">P50</span><span className="p95">P95</span></div>} /><div className="latency-scroll"><div className="latency-columns">{data.latency_distribution.map((point, index) => {
     const p5 = ((point.p5_ms ?? 0) / max) * 100; const p50 = ((point.p50_ms ?? 0) / max) * 100; const p95 = ((point.p95_ms ?? 0) / max) * 100;
     return <div className="latency-column" key={point.timestamp} title={`${formatFullTime(point.timestamp)} P5 ${formatMetric(point.p5_ms, "latency")}, P50 ${formatMetric(point.p50_ms, "latency")}, P95 ${formatMetric(point.p95_ms, "latency")}`}>{point.p95_ms !== null && <><i style={{ bottom: `${p5}%`, height: `${Math.max(p95 - p5, 1)}%` }} /><b className="dot p5" style={{ bottom: `${p5}%` }} /><b className="dot p50" style={{ bottom: `${p50}%` }} /><b className="dot p95" style={{ bottom: `${p95}%` }} /></>}{index % 6 === 0 && <small>{formatAxisTime(point.timestamp, "24h")}</small>}</div>;
   })}</div></div></section>;

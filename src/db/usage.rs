@@ -104,6 +104,14 @@ struct OverallMetric {
 }
 
 impl Database {
+    pub async fn first_request_timestamp(&self) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT CAST(strftime('%s', MIN(started_at)) AS INTEGER) FROM request_events",
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn metric_summary(
         &self,
         window: &MetricsWindow,
