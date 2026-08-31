@@ -16,6 +16,8 @@ The Rust service is the backend: it exposes the authenticated `/mcp` gateway, th
 
 The frontend reads aggregate metrics from the backend configured by `VITE_API_BASE_URL`. Set `ADMIN_CORS_ORIGINS` to the exact frontend origin (including scheme and port) when the services use different origins. Existing administrator routes remain authenticated and continue to use Secure cookies and CSRF protection.
 
+The MCP transport validates the inbound `Host` header to prevent DNS rebinding. Public deployments must add their exact gateway hostname to the comma-separated `MCP_ALLOWED_HOSTS` list, for example `MCP_ALLOWED_HOSTS=localhost,127.0.0.1,mcp.example.com`. A hostname entry allows that hostname on any port; use `hostname:port` to restrict it to one port.
+
 `GET /api/metrics?window=1h|24h|7d|30d` returns request count, success rate, P50/P95 latency, the preceding-period comparison, a zero-filled traffic series, 24 hours of five-minute activity buckets, and 24 hourly latency distributions. Timestamps are UTC and the monitor displays them as Asia/Shanghai (UTC+08:00). The response contains aggregates only and never includes request IDs, client keys, providers, or error details.
 
 ## Development

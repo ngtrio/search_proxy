@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tavily_mcp_gateway::{
-    AdminConfig, AppState, admin, app, config::Config, db::Database, provider::ProviderManager,
+    AdminConfig, AppState, McpConfig, admin, app, config::Config, db::Database,
+    provider::ProviderManager,
 };
 
 #[tokio::main]
@@ -28,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
         admin: AdminConfig {
             cors_origins: config.admin_cors_origins,
             secure_cookies: config.admin_cookie_secure,
+        },
+        mcp: McpConfig {
+            allowed_hosts: config.mcp_allowed_hosts,
         },
     };
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

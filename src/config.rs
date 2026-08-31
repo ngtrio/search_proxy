@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashSet,
+    env,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
 use anyhow::{Context, ensure};
 use axum::http::HeaderValue;
@@ -10,6 +15,7 @@ pub struct Config {
     pub admin_password: Option<String>,
     pub admin_cors_origins: Vec<String>,
     pub admin_cookie_secure: bool,
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 impl Config {
@@ -29,6 +35,9 @@ impl Config {
             admin_password: env::var("ADMIN_PASSWORD").ok(),
             admin_cors_origins: parse_cors_origins()?,
             admin_cookie_secure,
+            mcp_allowed_hosts: parse_allowed_hosts(
+                &env::var("MCP_ALLOWED_HOSTS").unwrap_or_else(|_| "localhost,127.0.0.1,::1".into()),
+            )?,
         })
     }
 
@@ -40,6 +49,34 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn parse_allowed_hosts(raw: &str) -> anyhow::Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut hosts = Vec::new();
+    for host in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        ensure!(host != "*", "MCP_ALLOWED_HOSTS cannot contain '*'");
+        let valid = host.parse::<IpAddr>().is_ok()
+            || host
+                .parse::<axum::http::uri::Authority>()
+                .is_ok_and(|authority| !authority.host().is_empty());
+        ensure!(
+            valid,
+            "MCP_ALLOWED_HOSTS contains an invalid host or host:port authority: {host}"
+        );
+        if seen.insert(host.to_ascii_lowercase()) {
+            hosts.push(host.to_owned());
+        }
+    }
+    ensure!(
+        !hosts.is_empty(),
+        "MCP_ALLOWED_HOSTS must contain at least one host"
+    );
+    Ok(hosts)
 }
 
 fn parse_cors_origins() -> anyhow::Result<Vec<String>> {
@@ -71,4 +108,29 @@ fn parse_cors_origins() -> anyhow::Result<Vec<String>> {
             Ok(normalized)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_allowed_hosts;
+
+    #[test]
+    fn parses_and_deduplicates_mcp_allowed_hosts() {
+        assert_eq!(
+            parse_allowed_hosts("localhost, mcp.example.com, mcp.example.com:8443, ::1").unwrap(),
+            [
+                "localhost",
+                "mcp.example.com",
+                "mcp.example.com:8443",
+                "::1"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_or_wildcard_mcp_allowed_host_list() {
+        assert!(parse_allowed_hosts("").is_err());
+        assert!(parse_allowed_hosts("localhost,*").is_err());
+        assert!(parse_allowed_hosts("https://mcp.example.com").is_err());
+    }
 }

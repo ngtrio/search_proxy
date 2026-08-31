@@ -19,7 +19,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tavily_mcp_gateway::{
-    AdminConfig, AppState, admin, app,
+    AdminConfig, AppState, McpConfig, admin, app,
     auth::digest,
     catalog::canonical_tools,
     db::{Database, NewProvider, ProviderKind, ProviderUpdate, RequestRecord},
@@ -125,6 +125,7 @@ async fn state() -> (AppState, tempfile::TempDir) {
         db,
         providers,
         admin: AdminConfig::default(),
+        mcp: McpConfig::default(),
     };
     admin::bootstrap(&state.db, "admin", Some("correct horse battery staple"))
         .await
@@ -362,6 +363,43 @@ async fn mcp_requires_auth_and_negotiates_all_legacy_revisions() {
         .unwrap();
         assert!(body.contains(version));
     }
+}
+
+#[tokio::test]
+async fn mcp_accepts_only_configured_host_headers() {
+    let (mut state, _dir) = state().await;
+    let secret = "tmg_allowed-host";
+    state
+        .db
+        .create_client_key("allowed-host", "tmg_allowed-host", &digest(secret), secret)
+        .await
+        .unwrap();
+    state.mcp.allowed_hosts = vec!["mcp.example.com".into()];
+    let gateway = app(state);
+    let request = |host: &'static str| {
+        Request::post("/mcp")
+            .header(header::HOST, host)
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let allowed = gateway
+        .clone()
+        .oneshot(request("mcp.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    let rejected = gateway
+        .oneshot(request("attacker.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

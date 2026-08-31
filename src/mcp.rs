@@ -84,6 +84,7 @@ impl ServerHandler for GatewayHandler {
 
 pub fn routes(state: AppState) -> Router<AppState> {
     let handler_state = state.clone();
+    let allowed_hosts = state.mcp.allowed_hosts.clone();
     let service: StreamableHttpService<GatewayHandler, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -93,6 +94,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             },
             Default::default(),
             StreamableHttpServerConfig::default()
+                .with_allowed_hosts(allowed_hosts)
                 .with_legacy_session_mode(true)
                 .with_json_response(false),
         );

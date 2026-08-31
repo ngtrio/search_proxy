@@ -29,11 +29,25 @@ impl Default for AdminConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct McpConfig {
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub providers: Arc<ProviderManager>,
     pub admin: AdminConfig,
+    pub mcp: McpConfig,
 }
 
 pub fn app(state: AppState) -> Router {
