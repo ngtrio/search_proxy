@@ -5,7 +5,7 @@ services:
     environment:
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
-      ADMIN_CORS_ORIGINS: ${ADMIN_CORS_ORIGINS:-http://localhost:8080}
+      ADMIN_CORS_ORIGINS: ${ADMIN_CORS_ORIGINS:-http://localhost:3001}
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-true}
       DATABASE_URL: sqlite:///data/gateway.db?mode=rwc
     volumes:
@@ -28,7 +28,7 @@ services:
       gateway:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:3000"
+      - "127.0.0.1:3001:3000"
     healthcheck:
       test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/"]
       interval: 15s
