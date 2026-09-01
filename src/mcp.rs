@@ -12,8 +12,8 @@ use axum::{
 use rmcp::{
     ErrorData, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, ListToolsResult, PaginatedRequestParams,
-        ProtocolVersion, ServerCapabilities, ServerInfo,
+        CacheScope, CallToolRequestParams, CallToolResponse, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -53,7 +53,9 @@ impl ServerHandler for GatewayHandler {
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(
             self.state.providers.tools().to_vec(),
-        )))
+        )
+        .with_ttl_ms(300_000)
+        .with_cache_scope(CacheScope::Public)))
     }
 
     async fn call_tool(

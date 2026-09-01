@@ -506,6 +506,62 @@ async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
 }
 
 #[tokio::test]
+async fn mcp_2026_tools_list_includes_required_cache_hints() {
+    let (state, _dir) = state().await;
+    let secret = "tmg_cache-hints";
+    state
+        .db
+        .create_client_key("cache-hints", "tmg_cache", &digest(secret), secret)
+        .await
+        .unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Mcp-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "tools/list")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientInfo": {
+                                    "name": "test",
+                                    "version": "1"
+                                },
+                                "io.modelcontextprotocol/clientCapabilities": {}
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed = body_sse_json(response).await;
+    assert!(
+        listed["result"]["ttlMs"].is_number(),
+        "2026-07-28 tools/list must include a numeric ttlMs: {listed}"
+    );
+    assert!(
+        matches!(
+            listed["result"]["cacheScope"].as_str(),
+            Some("public" | "private")
+        ),
+        "2026-07-28 tools/list must include a valid cacheScope: {listed}"
+    );
+}
+
+#[tokio::test]
 async fn modern_discovery_is_stateless() {
     let (state, _dir) = state().await;
     let secret = "tmg_modern";
