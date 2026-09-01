@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    Json,
     body::Body,
-    http::{Request, StatusCode, header},
+    extract::{Path, State},
+    http::{HeaderMap, Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
 use rmcp::{
@@ -32,7 +34,51 @@ struct MockSearchix {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     fail: Arc<std::sync::atomic::AtomicBool>,
     advertise_all_tools: Arc<std::sync::atomic::AtomicBool>,
+    return_pending_research: Arc<std::sync::atomic::AtomicBool>,
     last_tool: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Default)]
+struct MockResearchApi {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    pending_responses: Arc<std::sync::atomic::AtomicUsize>,
+    saw_bearer: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn mock_research_status(
+    State(api): State<MockResearchApi>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let call = api.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    api.saw_bearer.store(
+        headers
+            .get(header::AUTHORIZATION)
+            .is_some_and(|value| value == "Bearer test"),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    if call
+        < api
+            .pending_responses
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "request_id": request_id,
+                "status": "in_progress"
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "request_id": request_id,
+            "status": "completed",
+            "content": "finished research",
+            "sources": [{"url": "https://example.test/source"}]
+        })),
+    )
 }
 
 impl ServerHandler for MockSearchix {
@@ -104,6 +150,20 @@ impl ServerHandler for MockSearchix {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ErrorData::internal_error("scripted failure", None));
+        }
+        if request.name.ends_with("tavily_research")
+            && self
+                .return_pending_research
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                json!({
+                    "request_id": "research-123",
+                    "status": "pending"
+                })
+                .to_string(),
+            )])
+            .into());
         }
         Ok(CallToolResult::success(vec![ContentBlock::text("mock result")]).into())
     }
@@ -1113,6 +1173,87 @@ async fn provider_startup_connect_paginates_maps_and_routes_all_tools() {
             .call("tavily_search", arguments)
             .await
             .is_ok()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn pending_research_is_polled_on_the_selected_provider_until_completed() {
+    let mock = MockSearchix::default();
+    mock.advertise_all_tools
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    mock.return_pending_research
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let research_api = MockResearchApi::default();
+    research_api
+        .pending_responses
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let service: StreamableHttpService<MockSearchix, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let mock = mock.clone();
+                move || Ok(mock.clone())
+            },
+            Default::default(),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(false),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn({
+        let research_api = research_api.clone();
+        async move {
+            let router = axum::Router::new()
+                .nest_service("/mcp", service)
+                .route(
+                    "/api/tavily/research/{request_id}",
+                    axum::routing::get(mock_research_status),
+                )
+                .with_state(research_api);
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+
+    let (state, _dir) = state().await;
+    state
+        .providers
+        .create(NewProvider {
+            kind: ProviderKind::Searchix,
+            name: "mock research".into(),
+            endpoint: format!("http://{address}/mcp"),
+            bearer_token: "test".into(),
+            weight: 1,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("provider_specific".into(), json!(true));
+    let (_, result) = state
+        .providers
+        .call("tavily_research", arguments)
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["status"], "completed");
+    assert_eq!(result["structuredContent"]["content"], "finished research");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("finished research")
+    );
+    assert_eq!(
+        research_api.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert!(
+        research_api
+            .saw_bearer
+            .load(std::sync::atomic::Ordering::SeqCst)
     );
     task.abort();
 }

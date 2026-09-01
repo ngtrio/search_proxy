@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -93,7 +93,14 @@ struct ConnectedProvider {
     bearer_token: String,
     upstream_tools: HashMap<String, String>,
     client: RunningService<RoleClient, ClientInfo>,
+    http_client: reqwest::Client,
 }
+
+const INITIAL_RESEARCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_RESEARCH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const MINI_RESEARCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_RESEARCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const RESEARCH_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderToolMapping {
@@ -178,7 +185,7 @@ impl ProviderManager {
         };
         let desired = ProviderConfig {
             id,
-            kind: update.kind.clone(),
+            kind: update.kind,
             name: update.name.clone(),
             endpoint: update.endpoint.clone(),
             bearer_token: update
@@ -358,9 +365,35 @@ impl ProviderManager {
             .get(tool_name)
             .expect("selected provider supports requested tool")
             .clone();
+        let research_timeout = arguments
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| *model == "mini")
+            .map_or(DEFAULT_RESEARCH_TIMEOUT, |_| MINI_RESEARCH_TIMEOUT);
         let params = CallToolRequestParams::new(upstream_name).with_arguments(arguments);
         match provider.client.call_tool(params).await {
-            Ok(result) => Ok((id, result)),
+            Ok(result) => {
+                let result = if tool_name == "tavily_research" && !result.is_error.unwrap_or(false)
+                {
+                    match pending_research_id(&result) {
+                        Some(request_id) => provider
+                            .poll_research(request_id, research_timeout)
+                            .await
+                            .map_err(|error| {
+                                tracing::warn!(
+                                    provider_id = id,
+                                    error = %error,
+                                    "provider research polling failed"
+                                );
+                                ProviderFailure::after_routing(id, ProviderError::Failed(error))
+                            })?,
+                        None => result,
+                    }
+                } else {
+                    result
+                };
+                Ok((id, result))
+            }
             Err(error) => {
                 tracing::warn!(
                     provider_id = id,
@@ -481,6 +514,7 @@ impl ConnectedProvider {
             bearer_token: provider.bearer_token,
             upstream_tools,
             client,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -498,6 +532,7 @@ impl ConnectedProvider {
             bearer_token: provider.bearer_token,
             upstream_tools,
             client,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -506,6 +541,104 @@ impl ConnectedProvider {
             && self.endpoint == provider.endpoint
             && self.bearer_token == provider.bearer_token
     }
+
+    async fn poll_research(
+        &self,
+        request_id: String,
+        max_duration: Duration,
+    ) -> anyhow::Result<CallToolResult> {
+        let url = research_status_url(&self.endpoint, &request_id)?;
+        let deadline = Instant::now() + max_duration;
+        let mut interval = INITIAL_RESEARCH_POLL_INTERVAL;
+
+        loop {
+            let response = self
+                .http_client
+                .get(url.clone())
+                .bearer_auth(&self.bearer_token)
+                .timeout(RESEARCH_STATUS_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .context("research status request failed")?;
+            let status_code = response.status();
+            if !status_code.is_success() {
+                anyhow::bail!("research status request returned HTTP {status_code}");
+            }
+            let body = response
+                .json::<Value>()
+                .await
+                .context("research status response was not valid JSON")?;
+            match body.get("status").and_then(Value::as_str) {
+                Some("completed") => return Ok(research_result(body, false)),
+                Some("failed") => return Ok(research_result(body, true)),
+                Some("pending" | "in_progress") => {}
+                Some(status) => anyhow::bail!("unknown research status {status}"),
+                None => anyhow::bail!("research status response omitted status"),
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Research task {request_id} timed out"
+                ))]));
+            }
+            tokio::time::sleep(interval.min(deadline.saturating_duration_since(now))).await;
+            interval = interval.mul_f32(1.5).min(MAX_RESEARCH_POLL_INTERVAL);
+        }
+    }
+}
+
+fn pending_research_id(result: &CallToolResult) -> Option<String> {
+    let from_value = |value: &Value| {
+        matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("pending" | "in_progress")
+        )
+        .then(|| value.get("request_id").and_then(Value::as_str))
+        .flatten()
+        .filter(|request_id| !request_id.is_empty())
+        .map(str::to_owned)
+    };
+
+    result
+        .structured_content
+        .as_ref()
+        .and_then(from_value)
+        .or_else(|| {
+            result.content.iter().find_map(|content| {
+                let ContentBlock::Text(text) = content else {
+                    return None;
+                };
+                serde_json::from_str::<Value>(&text.text)
+                    .ok()
+                    .as_ref()
+                    .and_then(from_value)
+            })
+        })
+}
+
+fn research_status_url(endpoint: &str, request_id: &str) -> anyhow::Result<url::Url> {
+    let mut url = endpoint
+        .parse::<url::Url>()
+        .context("provider endpoint is not a valid URL")?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path("/api/tavily/research");
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("provider endpoint cannot be a base URL"))?
+        .push(request_id);
+    Ok(url)
+}
+
+fn research_result(body: Value, is_error: bool) -> CallToolResult {
+    let text = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
+    let mut result = if is_error {
+        CallToolResult::error(vec![ContentBlock::text(text)])
+    } else {
+        CallToolResult::success(vec![ContentBlock::text(text)])
+    };
+    result.structured_content = Some(body);
+    result
 }
 
 async fn connect_config(
@@ -622,6 +755,64 @@ fn mapped_name_candidates(kind: ProviderKind, canonical_name: &str) -> Vec<Mappe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_research_is_detected_in_text_or_structured_content() {
+        let text = CallToolResult::success(vec![ContentBlock::text(
+            r#"{"request_id":"text-id","status":"pending"}"#,
+        )]);
+        assert_eq!(pending_research_id(&text).as_deref(), Some("text-id"));
+
+        let mut structured = CallToolResult::success(Vec::new());
+        structured.structured_content = Some(serde_json::json!({
+            "request_id": "structured-id",
+            "status": "in_progress"
+        }));
+        assert_eq!(
+            pending_research_id(&structured).as_deref(),
+            Some("structured-id")
+        );
+
+        let completed = CallToolResult::success(vec![ContentBlock::text(
+            r#"{"request_id":"done-id","status":"completed"}"#,
+        )]);
+        assert_eq!(pending_research_id(&completed), None);
+
+        let missing_id =
+            CallToolResult::success(vec![ContentBlock::text(r#"{"status":"pending"}"#)]);
+        assert_eq!(pending_research_id(&missing_id), None);
+    }
+
+    #[test]
+    fn failed_research_becomes_a_structured_tool_error() {
+        let result = research_result(
+            serde_json::json!({
+                "request_id": "failed-id",
+                "status": "failed"
+            }),
+            true,
+        );
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["request_id"],
+            "failed-id"
+        );
+    }
+
+    #[test]
+    fn research_status_url_stays_on_the_selected_provider_origin() {
+        let url = research_status_url(
+            "https://search.example/mcp?session=ignored",
+            "request/with spaces",
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://search.example/api/tavily/research/request%2Fwith%20spaces"
+        );
+    }
 
     #[test]
     fn provider_name_candidates_cover_every_canonical_tool() {
