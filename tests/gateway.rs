@@ -463,7 +463,7 @@ async fn mcp_accepts_only_configured_host_headers() {
 }
 
 #[tokio::test]
-async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
+async fn mcp_hides_research_from_the_list_but_still_accepts_calls() {
     let (state, _dir) = state().await;
     let secret = "tmg_catalog";
     state
@@ -539,12 +539,7 @@ async fn mcp_lists_and_accepts_the_complete_pinned_tavily_catalog() {
             "tavily_extract",
             "tavily_crawl",
             "tavily_map",
-            "tavily_research",
         ]
-    );
-    assert_eq!(
-        listed["result"]["tools"][4]["inputSchema"]["required"],
-        json!(["input"])
     );
 
     let called = gateway

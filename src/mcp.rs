@@ -52,7 +52,13 @@ impl ServerHandler for GatewayHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
         std::future::ready(Ok(ListToolsResult::with_all_items(
-            self.state.providers.tools().to_vec(),
+            self.state
+                .providers
+                .tools()
+                .iter()
+                .filter(|tool| tool.name != "tavily_research")
+                .cloned()
+                .collect(),
         )
         .with_ttl_ms(300_000)
         .with_cache_scope(CacheScope::Public)))
